@@ -1,0 +1,56 @@
+# Architecture
+
+`jira-cli` is a single Go binary. It is driven far more often by an AI agent
+shelling out to it than by a human typing, and every design rule below follows
+from that.
+
+## Packages
+
+| Package | Owns | Must not |
+| --- | --- | --- |
+| `cmd/jira-cli` | process entry, `recover()`, exit-code delivery | contain business logic |
+| `internal/cli` | cobra commands, flag wiring, one file per noun | import `net/http`; contain business logic |
+| `internal/output` | envelope, `--fields` projection, text renderer | make network calls |
+| `internal/auth` | `CredentialStore`, native macOS Keychain, login transactions | be imported by `internal/jira` |
+| `internal/profile` | non-secret named profiles and validated Jira sites | read credentials |
+| `internal/skills` | safe installation for Codex and Claude Code | import auth or Jira clients |
+| `internal/jira` | hardened REST v3 client, retry, pagination, models | import `internal/auth` or `internal/profile` |
+| `internal/errx` | typed errors, exit codes, hints | import anything else in this module |
+
+## Dependency direction
+
+```
+cli → {output, auth, profile, skills, jira} → errx
+```
+
+Three invariants, verified with `go list -deps` rather than by eye:
+
+- **`internal/jira` must not import `internal/auth`.** Credentials arrive as
+  a value in the client constructor. Importing `auth` inverts the arrow and
+  makes the client untestable without a keychain.
+- **`internal/errx` imports nothing from this module.** The `candidates`
+  payload therefore uses `errx.Candidate`, never Jira model types. A convenience
+  import here is what turns the bottom of the stack into a cycle.
+- **`internal/cli` never calls `net/http`.** If a command needs a request that
+  the client does not expose, add the method to `internal/jira`.
+
+## Context
+
+Every I/O function takes `context.Context` as its first parameter. The root
+command builds one `context.WithTimeout` (default 30s, `--timeout`), threads it
+through `RunE`, and cancels it on `SIGINT`. Never create a `context.Background()`
+partway down the stack — that silently opts out of the user's timeout and
+cancellation.
+
+## Streams
+
+In JSON mode stdout carries **only** the response envelope. Every log, warning,
+progress line, and prompt goes to stderr. Text, raw, and explicit help output
+are caller-selected exceptions; agents should use the non-TTY JSON default.
+
+## Adding a command
+
+Every network command requires an explicit `--profile`; there is no active or
+stored default profile. Future mutations must use one shared construction
+helper so read-only, dry-run, confirmation, and project-allowlist rails cannot
+be skipped by a hand-built command.
