@@ -25,7 +25,24 @@ that installs into both Codex and Claude Code.
 
 ## Install
 
-Go 1.24.1 and the macOS SDK:
+### Homebrew
+
+On macOS, install the source-building Formula from the public tap:
+
+```bash
+brew install abigotado/tap/jira-agent-cli
+jira-cli version
+```
+
+The Formula is named `jira-agent-cli` to avoid a collision with the unrelated
+`jira-cli` Formula in Homebrew Core. It installs the `jira-cli` executable,
+builds it locally with CGO enabled, and uses the native Security.framework
+Keychain backend. It does not install an unsigned prebuilt executable or remove
+macOS quarantine metadata.
+
+### Go
+
+Go 1.24.1 and the macOS SDK are required:
 
 ```bash
 go install github.com/abigotado/jira-cli/cmd/jira-cli@latest
@@ -33,9 +50,9 @@ go install github.com/abigotado/jira-cli/cmd/jira-cli@latest
 
 Versioned source releases are listed under
 [Releases](https://github.com/abigotado/jira-cli/releases). Prebuilt binaries
-and a Homebrew cask are intentionally deferred until the macOS executable can
-be Developer ID signed and notarized. Linux and Windows distributions are also
-deferred until those platforms have a supported credential backend.
+and a Homebrew cask remain intentionally deferred until the macOS executable
+can be Developer ID signed and notarized. Linux and Windows distributions are
+also deferred until those platforms have a supported credential backend.
 
 ## Build from a checkout
 
