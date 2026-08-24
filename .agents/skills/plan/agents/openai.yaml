@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan jira-cli Change"
+  short_description: "Create an evidence-based jira-cli change plan"
+  default_prompt: "Use $plan to produce a dependency-ordered jira-cli implementation plan."

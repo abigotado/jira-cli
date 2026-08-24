@@ -1,0 +1,82 @@
+name: go
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Build and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Git Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "::error::These files are not gofmt-clean:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # -race is not optional here: the client paces and retries from shared
+      # state, and a data race there would surface as a wrong rate-limit
+      # decision rather than a crash.
+      - name: go test
+        run: go test -race ./...
+
+      # Validate workflow expressions and every shell block. Pinned so an
+      # unrelated pull request cannot turn red because a linter changed itself.
+      - name: actionlint
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # actionlint falls back to workflow-syntax-only when shellcheck is
+          # missing, and reports success having checked no shell at all.
+          # ubuntu-latest ships it; assert that rather than assume it, because
+          # the failure mode is silent loss of coverage.
+          if ! command -v shellcheck >/dev/null; then
+            echo "::error::shellcheck is not installed; actionlint would skip every run: block"
+            exit 1
+          fi
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          actionlint
+
+      # The generated contract is what agents read. If regenerating changes it,
+      # the committed copy no longer matches internal/errx.
+      - name: Generated contract is current
+        run: |
+          go generate ./...
+          DIRTY=$(git status --porcelain)
+          if [ -n "$DIRTY" ]; then
+            echo "::error::go generate changed tracked files; commit the result:"
+            echo "$DIRTY"
+            git diff
+            exit 1
+          fi

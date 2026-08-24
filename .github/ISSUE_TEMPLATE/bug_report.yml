@@ -1,0 +1,76 @@
+name: Bug report
+description: The binary does something it should not, or reports it wrongly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never paste an API token, Authorization header, Keychain output, or
+        environment dump. If a token may be exposed, revoke it before reporting.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `jira-cli version -o json`.
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: macOS 15.5, arm64
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact invocation, with non-secret profile metadata only.
+      render: console
+      placeholder: jira-cli issues get WL-123 --profile work
+    validations:
+      required: true
+
+  - type: input
+    id: exit_code
+    attributes:
+      label: Exit code
+      description: Output of `echo $?` immediately after the command.
+      placeholder: "8"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Envelope printed on stdout
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Whether it is profile-specific and when it started.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Confirmation
+      options:
+        - label: This report contains no API token, Authorization header, Keychain output, or environment dump.
+          required: true

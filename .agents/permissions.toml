@@ -1,0 +1,123 @@
+allow = [
+  "Edit",
+  "Write",
+  "Read",
+  "Glob",
+  "Grep",
+  "Bash(git status:*)",
+  "Bash(git diff:*)",
+  "Bash(git log:*)",
+  "Bash(git show:*)",
+  "Bash(go build:*)",
+  "Bash(go test:*)",
+  "Bash(go vet:*)",
+  "Bash(go doc:*)",
+  "Bash(go list:*)",
+  "Bash(gofmt:*)",
+  "Bash(golangci-lint run:*)",
+  "Bash(python3 .agents/scripts/sync-rules.py --check:*)",
+  "Bash(python3 -m unittest discover -s .agents/tests:*)",
+  # Downloads into the module cache without rewriting go.mod.
+  "Bash(go mod download:*)",
+  # Regenerates docs/contract.md and the skills reference from internal/errx.
+  # Running it is how a contributor clears the CI check that regenerating
+  # produces no diff, and whatever it writes shows up in `git diff` regardless.
+  "Bash(go generate:*)",
+  # How this repository gets pinned validation tooling such as actionlint.
+  "Bash(go install:*)",
+  # Local and reversible, and a commit still passes the hook that keeps agent
+  # and provider names out of published Git metadata. Sending it anywhere is
+  # `git push`, which stays in `ask` below.
+  "Bash(git commit:*)",
+  # Running the gate is reading: gofmt, vet, build, test. Only `install` and
+  # `uninstall`, which mutate local Git config, stay in `ask`.
+  "Bash(.githooks/pre-push:*)",
+]
+
+# `ask` is the only list that survives every permission mode. An entry here
+# prompts in auto mode and in bypassPermissions alike, where `allow`, `deny` and
+# the auto-mode classifier all behave differently. That makes it the expensive
+# list, so it holds what is worth stopping a session for and nothing that merely
+# has a side effect — a prompt spent on something `git checkout` undoes is a
+# prompt not read carefully when it matters.
+ask = [
+  # Rewrites go.mod and go.sum. AGENTS.md keeps dependency changes out of a
+  # feature change unless the accepted plan includes them.
+  "Bash(go mod tidy:*)",
+  "Bash(go get:*)",
+  # Publication, and the last point before a change leaves the machine. A tag
+  # the module proxy has seen cannot be taken back.
+  "Bash(git push:*)",
+  # `install` and `uninstall` mutate local Git config and are the developer's
+  # call, never the agent's — see .agents/rules/quality-gates.md.
+  "Bash(.githooks/install:*)",
+  "Bash(.githooks/uninstall:*)",
+]
+
+# The write-mode `sync-rules.py` / `compiler.py` invocations are deliberately
+# absent from `ask`. They are prefixes of their own allowed `--check` forms, and
+# the Codex policy compiles `ask` into prefix rules while ignoring `allow`, so
+# an explicit entry would make the read-only checks prompt too. With no entry
+# they fall through to `default_mode = "default"`, which prompts anyway.
+
+# Deny is defense-in-depth, not the security boundary. Claude matches Bash
+# rules on literal command prefixes, so a rewritten equivalent bypasses any
+# entry here. The boundary is that an unlisted command falls through to a
+# prompt in `default` mode, plus the Codex read-only/workspace sandbox profiles.
+deny = [
+  # Local credentials. Read, Write, and Edit are kept symmetric: denying only
+  # Read would still let a blanket-allowed Write clobber a credential file.
+  # Jira tokens belong in the OS keychain, never on disk
+  # in the repo — see .agents/rules/secrets.md.
+  "Read(./.env*)",
+  "Read(./**/.env*)",
+  "Write(./.env*)",
+  "Write(./**/.env*)",
+  "Edit(./.env*)",
+  "Edit(./**/.env*)",
+  "Read(./.netrc)",
+  "Write(./.netrc)",
+  "Edit(./.netrc)",
+  "Read(./*.pem)",
+  "Read(./**/*.pem)",
+  "Write(./*.pem)",
+  "Write(./**/*.pem)",
+  "Edit(./*.pem)",
+  "Edit(./**/*.pem)",
+  # Compiler-owned generated mirrors. Listed as concrete generated paths rather
+  # than a blanket `.claude/**`, because git worktrees live under
+  # `.claude/worktrees/` and must stay editable.
+  "Write(./.claude/agents/**)",
+  "Write(./.claude/rules/**)",
+  "Write(./.claude/hooks/**)",
+  "Write(./.claude/skills/**)",
+  "Write(./.claude/settings.json)",
+  "Edit(./.claude/agents/**)",
+  "Edit(./.claude/rules/**)",
+  "Edit(./.claude/hooks/**)",
+  "Edit(./.claude/skills/**)",
+  "Edit(./.claude/settings.json)",
+  "Write(./.codex/**)",
+  "Edit(./.codex/**)",
+  # Destructive git and filesystem prefixes, including common spellings.
+  "Bash(git reset --hard:*)",
+  "Bash(git clean:*)",
+  "Bash(git push --force:*)",
+  "Bash(git push -f:*)",
+  # Prefix rules alone cannot cover every spelling of a push that skips the
+  # gate; the `pre_push_guard` hook in hooks.toml is the real enforcement and
+  # parses the command. These entries stop the two literal forms earlier.
+  "Bash(git push --no-verify:*)",
+  "Bash(git config --local core.hooksPath:*)",
+  "Bash(git checkout --orphan:*)",
+  "Bash(rm -rf:*)",
+  "Bash(rm -fr:*)",
+  "Bash(rm -Rf:*)",
+  "Bash(rm -r -f:*)",
+  "Bash(rm -f -r:*)",
+  "Bash(sudo:*)",
+  "Bash(chmod 777:*)",
+  # Keychain reads must go through jira-cli's native Security.framework
+  # backend, never the security subprocess.
+  "Bash(security:*)",
+]

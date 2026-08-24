@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write jira-cli Tests"
+  short_description: "Add boundary tests for changed jira-cli behavior"
+  default_prompt: "Use $write-tests to cover the changed jira-cli behavior with table-driven tests."
