@@ -58,7 +58,7 @@ func TestIssuesSearchPreservesOpaqueCursorAndContext(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
 		t.Fatalf("decode envelope: %v", err)
 	}
-	if envelope.Meta == nil || envelope.Meta.Profile != "work" || envelope.Meta.Site != "https://finharbor.atlassian.net" {
+	if envelope.Meta == nil || envelope.Meta.Profile != "work" || envelope.Meta.Site != "https://example.atlassian.net" {
 		t.Fatalf("meta = %#v", envelope.Meta)
 	}
 	if envelope.Meta.NextCursor != reader.searchPage.NextPageToken || envelope.Meta.Truncated == nil || !*envelope.Meta.Truncated {
@@ -287,7 +287,7 @@ func testApp(store *fakeStore, reader *fakeJira) (*App, *bytes.Buffer, *bytes.Bu
 	stderr := &bytes.Buffer{}
 	app := &App{
 		registry: &fakeRegistry{profiles: []profile.Profile{{
-			Name: "work", Site: "https://finharbor.atlassian.net", Email: "user@example.com", TokenKind: profile.TokenKindClassic,
+			Name: "work", Site: "https://example.atlassian.net", Email: "user@example.com", TokenKind: profile.TokenKindClassic,
 		}}},
 		store:  store,
 		stdin:  bytes.NewBuffer(nil),

@@ -70,7 +70,7 @@ func TestProfileValidateSite(t *testing.T) {
 		site  string
 		valid bool
 	}{
-		{name: "exact tenant URL", site: "https://finharbor.atlassian.net", valid: true},
+		{name: "exact tenant URL", site: "https://example.atlassian.net", valid: true},
 		{name: "http", site: "http://tenant.atlassian.net"},
 		{name: "userinfo", site: "https://user@tenant.atlassian.net"},
 		{name: "port", site: "https://tenant.atlassian.net:443"},

@@ -23,7 +23,21 @@ that installs into both Codex and Claude Code.
   or repository content.
 - Codex and Claude Code use the same canonical `SKILL.md` and command contract.
 
-## Build
+## Install
+
+Go 1.24.1 and the macOS SDK:
+
+```bash
+go install github.com/abigotado/jira-cli/cmd/jira-cli@latest
+```
+
+Versioned source releases are listed under
+[Releases](https://github.com/abigotado/jira-cli/releases). Prebuilt binaries
+and a Homebrew cask are intentionally deferred until the macOS executable can
+be Developer ID signed and notarized. Linux and Windows distributions are also
+deferred until those platforms have a supported credential backend.
+
+## Build from a checkout
 
 Go 1.24.1 and the macOS SDK are required for the native Keychain backend.
 
