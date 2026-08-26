@@ -186,6 +186,36 @@ func Conflict(reason, format string, args ...any) *Error {
 	return &Error{Code: CodeConflict, Reason: reason, Message: fmt.Sprintf(format, args...), Hint: "re-read the issue and available transitions before deciding whether to retry"}
 }
 
+// WriteOutcomeUnknown reports that a write was dispatched but its result
+// could not be established safely. The caller must reconcile instead of
+// automatically repeating the request.
+func WriteOutcomeUnknown(operation string) *Error {
+	action := strings.TrimSpace(operation)
+	if action == "" {
+		action = "write"
+	}
+	return &Error{
+		Code:    CodeConflict,
+		Reason:  "WRITE_OUTCOME_UNKNOWN",
+		Message: fmt.Sprintf("the outcome of %s could not be established", action),
+		Hint:    fmt.Sprintf("re-read Jira to reconcile %s before deciding whether to retry", action),
+	}
+}
+
+// PayloadTooLarge reports a Jira endpoint's bounded payload rejection.
+func PayloadTooLarge(operation string) *Error {
+	action := strings.TrimSpace(operation)
+	if action == "" {
+		action = "request"
+	}
+	return &Error{
+		Code:    CodeUsage,
+		Reason:  "PAYLOAD_TOO_LARGE",
+		Message: fmt.Sprintf("Jira rejected the %s payload as too large", action),
+		Hint:    "shorten the plain-text fields and retry",
+	}
+}
+
 func upper(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))

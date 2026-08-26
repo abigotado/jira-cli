@@ -18,6 +18,7 @@ import (
 	"github.com/abigotado/jira-cli/internal/jira"
 	"github.com/abigotado/jira-cli/internal/output"
 	"github.com/abigotado/jira-cli/internal/profile"
+	"github.com/abigotado/jira-cli/internal/writepolicy"
 	"github.com/spf13/cobra"
 )
 
@@ -42,9 +43,29 @@ type jiraReader interface {
 	Comments(context.Context, string, jira.CommentPageOptions) (jira.CommentPage, error)
 }
 
+type jiraMutationClient interface {
+	jiraReader
+	IssueTypes(context.Context, string, jira.IssueTypePageOptions) (jira.IssueTypePage, error)
+	ValidateIssueType(context.Context, string, string) error
+	CreateIssue(context.Context, jira.CreateIssueRequest) (jira.Issue, error)
+	EditIssue(context.Context, string, jira.EditIssueRequest) error
+	TransitionIssue(context.Context, string, string) error
+	AddComment(context.Context, string, string) (jira.Comment, error)
+}
+
+type writePolicyRegistry interface {
+	WithPolicyLock(context.Context, string, func() error) error
+	Get(context.Context, string) (writepolicy.Policy, error)
+	GetBound(context.Context, profile.Profile) (writepolicy.Policy, error)
+	RequireProject(context.Context, profile.Profile, string) (writepolicy.Policy, error)
+	Set(context.Context, profile.Profile, []string) (writepolicy.Policy, error)
+	Clear(context.Context, string) error
+}
+
 // App contains only per-invocation state and injectable boundaries.
 type App struct {
 	registry profileRegistry
+	policies writePolicyRegistry
 	store    auth.CredentialStore
 
 	newJira         func(profile.Profile, auth.Credential, *slog.Logger) (jiraReader, error)
@@ -72,6 +93,7 @@ type App struct {
 // NewApp builds an App with production boundaries.
 func NewApp() *App {
 	registry, registryErr := profile.NewDefaultRegistry()
+	policies, policyErr := writepolicy.NewDefaultRegistry()
 	app := &App{
 		store:  auth.KeychainStore{},
 		stdin:  os.Stdin,
@@ -81,6 +103,9 @@ func NewApp() *App {
 	}
 	if registryErr == nil {
 		app.registry = registry
+	}
+	if policyErr == nil {
+		app.policies = policies
 	}
 	app.newJira = func(p profile.Profile, credential auth.Credential, logger *slog.Logger) (jiraReader, error) {
 		return jira.New(
@@ -106,7 +131,7 @@ func NewApp() *App {
 func (a *App) NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "jira-cli",
-		Short:         "Read Jira Cloud safely from the command line and AI agents",
+		Short:         "Use Jira Cloud safely from the command line and AI agents",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args: usageArgs(func(cmd *cobra.Command, args []string) error {
@@ -130,8 +155,8 @@ func (a *App) NewRootCommand() *cobra.Command {
 	flags.StringSliceVar(&a.fields, "fields", nil, "comma-separated fields to request and emit")
 	flags.DurationVar(&a.timeout, "timeout", defaultTimeout, "abort the command after this duration")
 	flags.BoolVarP(&a.verbose, "verbose", "v", false, "write redacted request activity to stderr")
-	flags.BoolVar(&a.assumeYes, "yes", false, "confirm a local overwrite or destructive action")
-	flags.BoolVar(&a.dryRun, "dry-run", false, "preview a supported local change without applying it")
+	flags.BoolVar(&a.assumeYes, "yes", false, "confirm a supported mutation or local overwrite")
+	flags.BoolVar(&a.dryRun, "dry-run", false, "preview a supported change without applying it or contacting Jira")
 
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		return errx.Usage("%v", err)
@@ -150,6 +175,49 @@ func (a *App) NewRootCommand() *cobra.Command {
 	return root
 }
 
+func (a *App) runMutation(ctx context.Context, projectKey, action string, fn func(jiraMutationClient, profile.Profile) error) error {
+	if a.profileName == "" {
+		return errx.ProfileRequired()
+	}
+	if a.registry == nil || a.policies == nil {
+		return errx.Internal("profile or write policy registry is unavailable")
+	}
+	return a.registry.WithProfileLock(ctx, a.profileName, func() error {
+		selected, err := a.registry.Get(ctx, a.profileName)
+		if err != nil {
+			return translateLocal(err, a.profileName)
+		}
+		return a.policies.WithPolicyLock(ctx, a.profileName, func() error {
+			if _, err := a.policies.RequireProject(ctx, selected, projectKey); err != nil {
+				return translateWritePolicy(err, selected.Name, projectKey)
+			}
+			if !a.dryRun && !a.assumeYes {
+				return errx.ConfirmRequired(action)
+			}
+			a.out.WithContext(selected.Name, selected.Site)
+			if a.dryRun {
+				return fn(nil, selected)
+			}
+			if selected.ExpiresAt != nil && !a.now().Before(*selected.ExpiresAt) {
+				return errx.Auth("TOKEN_EXPIRED", "the API token for profile %q is expired", selected.Name)
+			}
+			credential, err := a.store.Load(ctx, selected.Name)
+			if err != nil {
+				return translateLocal(err, selected.Name)
+			}
+			reader, err := a.newJira(selected, credential, a.log)
+			if err != nil {
+				return err
+			}
+			client, ok := reader.(jiraMutationClient)
+			if !ok {
+				return errx.Internal("Jira client does not implement mutation operations")
+			}
+			return fn(client, selected)
+		})
+	})
+}
+
 func (a *App) setup(cmd *cobra.Command, _ []string) error {
 	if a.jsonAlias && a.format != "" && a.format != string(output.FormatJSON) {
 		return errx.Usage("--json cannot be combined with --output %s", a.format)
@@ -163,6 +231,9 @@ func (a *App) setup(cmd *cobra.Command, _ []string) error {
 			return err
 		}
 		format = parsed
+	}
+	if format == output.FormatRaw && len(a.fields) > 0 {
+		return errx.Usage("--fields cannot be combined with --output raw")
 	}
 	a.out = &output.Writer{Format: format, Fields: a.fields, Out: a.stdout, Err: a.stderr}
 	level := slog.LevelWarn
@@ -279,6 +350,38 @@ func translateLocal(err error, name string) error {
 		return errx.Usage("API token input is invalid")
 	default:
 		return errx.Internal("local operation failed without exposing credential details")
+	}
+}
+
+func translateWritePolicy(err error, profileName, projectKey string) error {
+	if err == nil {
+		return nil
+	}
+	var typed *errx.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return errx.Translate(err)
+	case writepolicy.WasCommitted(err):
+		return errx.Conflict("WRITE_POLICY_OUTCOME_UNKNOWN", "the local write policy may have been updated despite a durability-check failure").
+			WithHint("run 'jira-cli auth allow-projects show --profile %s' before deciding whether to repeat the change", profileName)
+	case errors.Is(err, writepolicy.ErrNotFound):
+		return errx.Permission("WRITE_POLICY_MISSING", "profile %q has no local write allowlist", profileName).
+			WithHint("run 'jira-cli auth allow-projects set --profile NAME --project KEY --yes'")
+	case errors.Is(err, writepolicy.ErrStale):
+		return errx.Permission("WRITE_POLICY_STALE", "profile %q write allowlist belongs to different account metadata", profileName).
+			WithHint("review the current account, then reset its allowlist with auth allow-projects set")
+	case errors.Is(err, writepolicy.ErrProjectDenied):
+		return errx.Permission("PROJECT_NOT_ALLOWED", "project %q is not in profile %q local write allowlist", projectKey, profileName).
+			WithHint("run 'jira-cli auth allow-projects show --profile %s', then use set --yes with the complete intended --project list", profileName)
+	case errors.Is(err, writepolicy.ErrInvalid), errors.Is(err, profile.ErrInvalidProfile):
+		return errx.Usage("write policy input is invalid")
+	case errors.Is(err, writepolicy.ErrCorruptRegistry), errors.Is(err, writepolicy.ErrInsecurePermissions):
+		return errx.Internal("write policy registry cannot be used safely")
+	default:
+		return errx.Internal("local write policy operation failed")
 	}
 }
 

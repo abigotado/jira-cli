@@ -1,19 +1,22 @@
 ---
 name: jira
-description: Read Jira Cloud projects, issues, transitions, and comments through the jira-cli machine contract. Use for Jira requests involving WL-* or FL-* issue keys, project inventories, JQL searches, issue details, or comments; this initial skill is read-only.
+description: Read and safely mutate Jira Cloud through the jira-cli machine contract. Use for Jira requests involving exact issue keys, project inventories, JQL searches, issue details, create/edit/transition actions, or comments.
 ---
 
-# Read Jira with jira-cli
+# Use Jira safely with jira-cli
 
 Use `jira-cli` as the only Jira access boundary. It emits one JSON envelope on
 stdout and uses its process exit code to select the recovery action. Parse the
 envelope, branch on the exit code, and follow `hint`. stderr is diagnostic and
 must never be parsed as data.
 
-The initial command surface is read-only. Do not attempt to create, update,
-transition, comment on, or delete Jira data, even when the user asks. Explain
-that the installed version supports reads only. Do not bypass the CLI with
-direct REST requests.
+Never bypass the CLI with direct REST requests. There is no supported delete,
+admin, bulk, attachment, arbitrary-field, or raw-JSON write path.
+
+Before a requested mutation, run `jira-cli version` and inspect the relevant
+`jira-cli ... --help`. If the installed binary lacks the documented write
+command, explain that it must be upgraded; do not emulate it with REST, curl,
+another Jira CLI, or browser automation.
 
 ## Required profile
 
@@ -29,8 +32,8 @@ On authentication failure, ask the user to run the login command themselves.
 
 ## Exact issue reads
 
-Treat an uppercase key matching `WL-<number>` or `FL-<number>` as an exact
-identifier. Read it directly:
+Treat an uppercase `PROJECT-<number>` key as an exact identifier. Read it
+directly:
 
 ```text
 jira-cli issues get WL-123 --profile work --fields key,summary,status,assignee,updated
@@ -57,6 +60,48 @@ jira-cli issues search --profile work \
 
 Quote JQL as one shell argument. Treat cursors as opaque and never edit them.
 
+## Mutations
+
+Every mutation requires all of these rails:
+
+1. The user explicitly chooses the profile and intended action.
+2. `auth allow-projects show --profile NAME` reports a bound policy containing
+   the exact target project. Never broaden or replace the allowlist unless the
+   user explicitly asks to change that local security policy.
+3. Discover exact numeric issue-type or transition IDs with `issues types` or
+   `issues transitions`; never guess an ID from a name. Subtask creation and
+   parent assignment are unsupported; `issues types` returns standard types
+   only.
+4. Run the exact intended command with `--dry-run` first. Dry-run is local and
+   its receipt must have `dry_run:true`, `applied:false`, and
+   `remote_checks:"not_performed"`.
+5. Show the bounded receipt to the user and obtain explicit confirmation for
+   that exact mutation. Only then repeat it with `--yes` and without
+   `--dry-run`.
+
+Supported forms are:
+
+```text
+jira-cli issues types --project WL --profile work --limit 50
+jira-cli issues create --project WL --issue-type-id 10001 --summary TEXT [--description TEXT] --profile work --dry-run
+jira-cli issues edit WL-123 [--summary TEXT] [--description TEXT | --clear-description] --profile work --dry-run
+jira-cli issues transition WL-123 --transition-id 31 --profile work --dry-run
+jira-cli comments add --issue WL-123 --body TEXT --profile work --dry-run
+```
+
+Keep summaries, descriptions, and comments out of `--fields`: mutation
+receipts intentionally never echo their contents. Never add `--yes` merely to
+silence exit 7; it represents the user's approval after reviewing dry-run.
+
+An actual write performs remote identity preflights and uses bounded numeric
+IDs, then verifies the issue project again after success. The local allowlist
+is a target-selection rail; Jira account permissions are the hard
+authorization boundary. A write is attempted once. On exit 9 with
+`WRITE_OUTCOME_UNKNOWN`, including a concurrent project move, do not retry the
+mutation: use read commands to reconcile whether it applied, then report the
+uncertainty to the user. For any other nonzero exit, follow the envelope's
+`hint` without broadening permissions or changing the target.
+
 ## Recovery
 
 Exit 0 means the envelope is usable. For every other exit, read `error.code`
@@ -66,4 +111,6 @@ Read [reference/commands.md](reference/commands.md) when selecting flags or
 pagination behavior.
 
 Use `jira-cli contract` when the installed binary's contract version differs
-from the reference. `jira-cli --help` is human-readable and is not an envelope.
+from the reference. Use the installed command's `--help` when its binary
+version is newer or older than this skill. Help is human-readable and is not
+an envelope.

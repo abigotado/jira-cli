@@ -372,7 +372,7 @@ func TestEnhancedJQLPostIsRetrySafe(t *testing.T) {
 	}
 }
 
-func TestPostDoesNotInheritRetrySafety(t *testing.T) {
+func TestRequestMustDeclareReadOrWritePolicy(t *testing.T) {
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		calls++
@@ -386,10 +386,13 @@ func TestPostDoesNotInheritRetrySafety(t *testing.T) {
 		path:   "/rest/api/3/future-write",
 	}, nil)
 	if err == nil {
-		t.Fatal("expected server error")
+		t.Fatal("expected policy error")
 	}
-	if calls != 1 {
-		t.Errorf("calls = %d, want 1; a future POST must opt into retry safety explicitly", calls)
+	if errx.ExitCode(err) != errx.CodeInternal {
+		t.Fatalf("exit code = %d, want internal", errx.ExitCode(err))
+	}
+	if calls != 0 {
+		t.Errorf("calls = %d, want 0; every request must declare its policy", calls)
 	}
 }
 

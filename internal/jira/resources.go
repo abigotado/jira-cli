@@ -14,9 +14,9 @@ import (
 func (client *Client) Myself(ctx context.Context) (User, error) {
 	var user User
 	err := client.do(ctx, request{
-		method:    http.MethodGet,
-		path:      "/rest/api/3/myself",
-		retrySafe: true,
+		method: http.MethodGet,
+		path:   "/rest/api/3/myself",
+		policy: requestPolicyRead,
 	}, &user)
 	return user, err
 }
@@ -38,10 +38,10 @@ func (client *Client) Projects(ctx context.Context, options ProjectPageOptions) 
 	}
 	var page ProjectPage
 	err := client.do(ctx, request{
-		method:    http.MethodGet,
-		path:      "/rest/api/3/project/search",
-		query:     query,
-		retrySafe: true,
+		method: http.MethodGet,
+		path:   "/rest/api/3/project/search",
+		query:  query,
+		policy: requestPolicyRead,
 	}, &page)
 	return page, err
 }
@@ -53,9 +53,9 @@ func (client *Client) Project(ctx context.Context, keyOrID string) (Project, err
 	}
 	var project Project
 	err := client.do(ctx, request{
-		method:    http.MethodGet,
-		path:      "/rest/api/3/project/" + url.PathEscape(keyOrID),
-		retrySafe: true,
+		method: http.MethodGet,
+		path:   "/rest/api/3/project/" + url.PathEscape(keyOrID),
+		policy: requestPolicyRead,
 	}, &project)
 	return project, err
 }
@@ -71,10 +71,10 @@ func (client *Client) Issue(ctx context.Context, keyOrID string, fields []string
 	}
 	var issue Issue
 	err := client.do(ctx, request{
-		method:    http.MethodGet,
-		path:      "/rest/api/3/issue/" + url.PathEscape(keyOrID),
-		query:     query,
-		retrySafe: true,
+		method: http.MethodGet,
+		path:   "/rest/api/3/issue/" + url.PathEscape(keyOrID),
+		query:  query,
+		policy: requestPolicyRead,
 	}, &issue)
 	return issue, err
 }
@@ -90,10 +90,10 @@ func (client *Client) Search(ctx context.Context, search SearchRequest) (SearchP
 	}
 	var page SearchPage
 	err := client.do(ctx, request{
-		method:    http.MethodPost,
-		path:      "/rest/api/3/search/jql",
-		body:      search,
-		retrySafe: true,
+		method: http.MethodPost,
+		path:   "/rest/api/3/search/jql",
+		body:   search,
+		policy: requestPolicyRead,
 	}, &page)
 	return page, err
 }
@@ -105,9 +105,9 @@ func (client *Client) Transitions(ctx context.Context, issueKeyOrID string) ([]T
 	}
 	var response transitionsResponse
 	err := client.do(ctx, request{
-		method:    http.MethodGet,
-		path:      "/rest/api/3/issue/" + url.PathEscape(issueKeyOrID) + "/transitions",
-		retrySafe: true,
+		method: http.MethodGet,
+		path:   "/rest/api/3/issue/" + url.PathEscape(issueKeyOrID) + "/transitions",
+		policy: requestPolicyRead,
 	}, &response)
 	return response.Transitions, err
 }
@@ -129,10 +129,10 @@ func (client *Client) Comments(ctx context.Context, issueKeyOrID string, options
 	}
 	var page CommentPage
 	err := client.do(ctx, request{
-		method:    http.MethodGet,
-		path:      "/rest/api/3/issue/" + url.PathEscape(issueKeyOrID) + "/comment",
-		query:     query,
-		retrySafe: true,
+		method: http.MethodGet,
+		path:   "/rest/api/3/issue/" + url.PathEscape(issueKeyOrID) + "/comment",
+		query:  query,
+		policy: requestPolicyRead,
 	}, &page)
 	return page, err
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/abigotado/jira-cli/internal/jira"
 	"github.com/abigotado/jira-cli/internal/output"
 	"github.com/abigotado/jira-cli/internal/profile"
+	"github.com/abigotado/jira-cli/internal/writepolicy"
 )
 
 func TestNetworkCommandRequiresExplicitProfileWithoutReadingCredential(t *testing.T) {
@@ -289,6 +290,13 @@ func testApp(store *fakeStore, reader *fakeJira) (*App, *bytes.Buffer, *bytes.Bu
 		registry: &fakeRegistry{profiles: []profile.Profile{{
 			Name: "work", Site: "https://example.atlassian.net", Email: "user@example.com", TokenKind: profile.TokenKindClassic,
 		}}},
+		policies: &fakePolicyRegistry{policy: writepolicy.Policy{
+			Profile: "work",
+			Identity: writepolicy.Identity{
+				Site: "https://example.atlassian.net", Email: "user@example.com", TokenKind: string(profile.TokenKindClassic),
+			},
+			Projects: []string{"FL", "WL"},
+		}},
 		store:  store,
 		stdin:  bytes.NewBuffer(nil),
 		stdout: stdout,
@@ -308,6 +316,17 @@ func assertErrorReason(t *testing.T, raw []byte, reason string) {
 	}
 	if envelope.Error == nil || envelope.Error.Code != reason {
 		t.Fatalf("error = %#v, want reason %q", envelope.Error, reason)
+	}
+}
+
+func assertErrorHintContains(t *testing.T, raw []byte, want string) {
+	t.Helper()
+	var envelope output.Envelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode envelope: %v\n%s", err, raw)
+	}
+	if !strings.Contains(envelope.Hint, want) {
+		t.Fatalf("hint = %q, want substring %q", envelope.Hint, want)
 	}
 }
 
@@ -385,10 +404,36 @@ func (s *fakeStore) Delete(context.Context, string) error {
 }
 
 type fakeJira struct {
-	searchPage    jira.SearchPage
-	searchRequest jira.SearchRequest
-	panicValue    any
-	issue         jira.Issue
+	searchPage         jira.SearchPage
+	searchRequest      jira.SearchRequest
+	panicValue         any
+	issue              jira.Issue
+	issueSequence      []jira.Issue
+	project            jira.Project
+	issueTypes         jira.IssueTypePage
+	issueTypeProjectID string
+	issueTypeOptions   jira.IssueTypePageOptions
+	transitions        []jira.Transition
+	created            jira.Issue
+	comment            jira.Comment
+	projectCalls       int
+	issueCalls         int
+	typeCalls          int
+	validateCalls      int
+	createCalls        int
+	editCalls          int
+	transitionCalls    int
+	commentCalls       int
+	validatedProjectID string
+	validatedTypeID    string
+	validateErr        error
+	createInput        jira.CreateIssueRequest
+	editIssueID        string
+	editInput          jira.EditIssueRequest
+	transitionIssueID  string
+	transitionID       string
+	commentIssueID     string
+	commentBody        string
 }
 
 func (f *fakeJira) Myself(context.Context) (jira.User, error) {
@@ -400,17 +445,64 @@ func (f *fakeJira) Myself(context.Context) (jira.User, error) {
 func (*fakeJira) Projects(context.Context, jira.ProjectPageOptions) (jira.ProjectPage, error) {
 	return jira.ProjectPage{}, nil
 }
-func (*fakeJira) Project(context.Context, string) (jira.Project, error) {
-	return jira.Project{}, nil
+func (f *fakeJira) Project(context.Context, string) (jira.Project, error) {
+	f.projectCalls++
+	return f.project, nil
 }
 func (f *fakeJira) Issue(context.Context, string, []string) (jira.Issue, error) {
+	f.issueCalls++
+	if len(f.issueSequence) > 0 {
+		index := f.issueCalls - 1
+		if index >= len(f.issueSequence) {
+			index = len(f.issueSequence) - 1
+		}
+		return f.issueSequence[index], nil
+	}
 	return f.issue, nil
 }
 func (f *fakeJira) Search(_ context.Context, request jira.SearchRequest) (jira.SearchPage, error) {
 	f.searchRequest = request
 	return f.searchPage, nil
 }
-func (*fakeJira) Transitions(context.Context, string) ([]jira.Transition, error) { return nil, nil }
+func (f *fakeJira) Transitions(context.Context, string) ([]jira.Transition, error) {
+	return f.transitions, nil
+}
 func (*fakeJira) Comments(context.Context, string, jira.CommentPageOptions) (jira.CommentPage, error) {
 	return jira.CommentPage{}, nil
+}
+
+func (f *fakeJira) IssueTypes(_ context.Context, projectID string, options jira.IssueTypePageOptions) (jira.IssueTypePage, error) {
+	f.typeCalls++
+	f.issueTypeProjectID, f.issueTypeOptions = projectID, options
+	return f.issueTypes, nil
+}
+
+func (f *fakeJira) ValidateIssueType(_ context.Context, projectID, issueTypeID string) error {
+	f.validateCalls++
+	f.validatedProjectID, f.validatedTypeID = projectID, issueTypeID
+	return f.validateErr
+}
+
+func (f *fakeJira) CreateIssue(_ context.Context, input jira.CreateIssueRequest) (jira.Issue, error) {
+	f.createCalls++
+	f.createInput = input
+	return f.created, nil
+}
+
+func (f *fakeJira) EditIssue(_ context.Context, issueID string, input jira.EditIssueRequest) error {
+	f.editCalls++
+	f.editIssueID, f.editInput = issueID, input
+	return nil
+}
+
+func (f *fakeJira) TransitionIssue(_ context.Context, issueID, transitionID string) error {
+	f.transitionCalls++
+	f.transitionIssueID, f.transitionID = issueID, transitionID
+	return nil
+}
+
+func (f *fakeJira) AddComment(_ context.Context, issueID, body string) (jira.Comment, error) {
+	f.commentCalls++
+	f.commentIssueID, f.commentBody = issueID, body
+	return f.comment, nil
 }
