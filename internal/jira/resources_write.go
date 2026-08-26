@@ -10,13 +10,19 @@ import (
 	"github.com/abigotado/jira-cli/internal/errx"
 )
 
+const (
+	issueTypePageSize = 100
+	maxIssueTypePages = 100
+	maxIssueTypes     = issueTypePageSize * maxIssueTypePages
+)
+
 // IssueTypes returns issue types that can be created in one exact project.
 func (client *Client) IssueTypes(ctx context.Context, projectID string, options IssueTypePageOptions) (IssueTypePage, error) {
 	if err := requireNumericID(projectID, "project"); err != nil {
 		return IssueTypePage{}, err
 	}
-	if options.StartAt < 0 || options.MaxResults < 0 {
-		return IssueTypePage{}, errx.Usage("issue type pagination values cannot be negative")
+	if options.StartAt < 0 || options.MaxResults < 0 || options.MaxResults > issueTypePageSize {
+		return IssueTypePage{}, errx.Usage("issue type pagination values must use a nonnegative offset and a limit no greater than %d", issueTypePageSize)
 	}
 	query := make(url.Values)
 	if options.StartAt > 0 {
@@ -25,14 +31,17 @@ func (client *Client) IssueTypes(ctx context.Context, projectID string, options 
 	if options.MaxResults > 0 {
 		query.Set("maxResults", strconv.Itoa(options.MaxResults))
 	}
-	var page IssueTypePage
+	var wire issueTypePageWire
 	err := client.do(ctx, request{
 		method: http.MethodGet,
 		path:   "/rest/api/3/issue/createmeta/" + url.PathEscape(projectID) + "/issuetypes",
 		query:  query,
 		policy: requestPolicyRead,
-	}, &page)
-	return page, err
+	}, &wire)
+	if err != nil {
+		return IssueTypePage{}, err
+	}
+	return validatedIssueTypePage(wire, options.StartAt)
 }
 
 // ValidateIssueType verifies that an exact numeric standard issue type belongs
@@ -45,32 +54,102 @@ func (client *Client) ValidateIssueType(ctx context.Context, projectID, issueTyp
 	if err := requireNumericID(issueTypeID, "issue type"); err != nil {
 		return err
 	}
-	const maxPages = 100
 	startAt := 0
-	for pageNumber := 0; pageNumber < maxPages; pageNumber++ {
-		page, err := client.IssueTypes(ctx, projectID, IssueTypePageOptions{StartAt: startAt, MaxResults: 100})
+	total := -1
+	foundStandard := false
+	foundSubtask := false
+	seen := make(map[string]struct{})
+	for pageNumber := 0; pageNumber < maxIssueTypePages; pageNumber++ {
+		page, err := client.IssueTypes(ctx, projectID, IssueTypePageOptions{StartAt: startAt, MaxResults: issueTypePageSize})
 		if err != nil {
 			return err
 		}
+		if total < 0 {
+			total = page.Total
+		} else if page.Total != total {
+			return errx.Internal("Jira issue type pagination changed its total")
+		}
 		for _, issueType := range page.Values {
-			if issueType.ID != issueTypeID {
-				continue
+			if _, exists := seen[issueType.ID]; exists {
+				return errx.Internal("Jira issue type metadata contains a duplicate issue type ID")
 			}
-			if issueType.Subtask {
-				return errx.Usage("subtask issue types are not supported; choose a standard issue type")
+			seen[issueType.ID] = struct{}{}
+			if issueType.ID == issueTypeID {
+				if issueType.Subtask {
+					foundSubtask = true
+				} else {
+					foundStandard = true
+				}
 			}
-			return nil
 		}
 		next := page.StartAt + len(page.Values)
-		if next >= page.Total {
+		if next == total {
+			if foundSubtask {
+				return errx.Usage("subtask issue types are not supported; choose a standard issue type")
+			}
+			if foundStandard {
+				return nil
+			}
 			return errx.NotFound("issue type", issueTypeID, nil)
 		}
-		if next <= startAt {
-			return errx.Internal("Jira issue type pagination did not advance")
-		}
 		startAt = next
+		if pageNumber == maxIssueTypePages-1 {
+			return errx.Internal("Jira issue type pagination exceeded the safety limit")
+		}
 	}
 	return errx.Internal("Jira issue type pagination exceeded the safety limit")
+}
+
+func validatedIssueTypePage(wire issueTypePageWire, requestedStartAt int) (IssueTypePage, error) {
+	if wire.StartAt == nil || wire.MaxResults == nil || wire.Total == nil || wire.Values == nil {
+		return IssueTypePage{}, errx.Internal("Jira issue type metadata is incomplete")
+	}
+	if *wire.StartAt != requestedStartAt {
+		return IssueTypePage{}, errx.Internal("Jira issue type pagination returned an unexpected offset")
+	}
+	if *wire.MaxResults <= 0 || *wire.MaxResults > issueTypePageSize {
+		return IssueTypePage{}, errx.Internal("Jira issue type pagination returned an invalid page size")
+	}
+	if *wire.Total < 0 || *wire.Total > maxIssueTypes {
+		return IssueTypePage{}, errx.Internal("Jira issue type pagination returned an invalid total")
+	}
+	if *wire.StartAt > *wire.Total || len(wire.Values) > *wire.MaxResults || len(wire.Values) > issueTypePageSize {
+		return IssueTypePage{}, errx.Internal("Jira issue type pagination overran its total")
+	}
+	next := *wire.StartAt + len(wire.Values)
+	if next > *wire.Total || (*wire.StartAt < *wire.Total && next <= *wire.StartAt) {
+		return IssueTypePage{}, errx.Internal("Jira issue type pagination did not make valid progress")
+	}
+
+	values := make([]IssueType, 0, len(wire.Values))
+	seen := make(map[string]struct{}, len(wire.Values))
+	for _, issueType := range wire.Values {
+		if issueType.ID == nil || !validNumericMetadataID(*issueType.ID) || issueType.Subtask == nil {
+			return IssueTypePage{}, errx.Internal("Jira issue type metadata is incomplete or malformed")
+		}
+		if _, exists := seen[*issueType.ID]; exists {
+			return IssueTypePage{}, errx.Internal("Jira issue type metadata contains a duplicate issue type ID")
+		}
+		seen[*issueType.ID] = struct{}{}
+		values = append(values, IssueType{
+			ID: *issueType.ID, Name: issueType.Name, Description: issueType.Description, Subtask: *issueType.Subtask,
+		})
+	}
+	return IssueTypePage{
+		StartAt: *wire.StartAt, MaxResults: *wire.MaxResults, Total: *wire.Total, Values: values,
+	}, nil
+}
+
+func validNumericMetadataID(value string) bool {
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // CreateIssue creates one issue using only bounded typed fields.
@@ -103,6 +182,12 @@ func (client *Client) CreateIssue(ctx context.Context, input CreateIssueRequest)
 		}
 		payload.Description = &document
 	}
+	if err := client.ValidateIssueType(ctx, input.ProjectID, input.IssueTypeID); err != nil {
+		return Issue{}, err
+	}
+	if err := client.validateCreateFields(ctx, input); err != nil {
+		return Issue{}, err
+	}
 	var created Issue
 	err := client.do(ctx, request{
 		method: http.MethodPost, path: "/rest/api/3/issue",
@@ -112,6 +197,144 @@ func (client *Client) CreateIssue(ctx context.Context, input CreateIssueRequest)
 		policy: requestPolicyWrite, operation: "issues.create", wantStatus: http.StatusCreated,
 	}, &created)
 	return created, err
+}
+
+func (client *Client) validateCreateFields(ctx context.Context, input CreateIssueRequest) error {
+	const (
+		pageSize      = 100
+		maxPages      = 100
+		maxFields     = 10_000
+		maxFieldIDLen = 255
+		maxOperation  = 64
+	)
+
+	provided := map[string]bool{
+		"project":   true,
+		"issuetype": true,
+		"summary":   true,
+	}
+	if input.Description != nil {
+		provided["description"] = true
+	}
+
+	seen := make(map[string]struct{})
+	unsupported := make(map[string]struct{})
+	provideDescription := false
+	startAt := 0
+	total := -1
+	for pageNumber := 0; pageNumber < maxPages; pageNumber++ {
+		query := make(url.Values)
+		query.Set("startAt", strconv.Itoa(startAt))
+		query.Set("maxResults", strconv.Itoa(pageSize))
+		var page IssueCreateFieldPage
+		if err := client.do(ctx, request{
+			method: http.MethodGet,
+			path:   "/rest/api/3/issue/createmeta/" + url.PathEscape(input.ProjectID) + "/issuetypes/" + url.PathEscape(input.IssueTypeID),
+			query:  query, policy: requestPolicyRead,
+		}, &page); err != nil {
+			return err
+		}
+		if page.StartAt == nil || page.MaxResults == nil || page.Total == nil || page.Fields == nil {
+			return errx.Internal("Jira create-field metadata is incomplete")
+		}
+		if *page.StartAt != startAt {
+			return errx.Internal("Jira create-field pagination returned an unexpected offset")
+		}
+		if *page.MaxResults <= 0 || *page.MaxResults > pageSize {
+			return errx.Internal("Jira create-field pagination returned an invalid page size")
+		}
+		if *page.Total < 0 || *page.Total > maxFields {
+			return errx.Internal("Jira create-field pagination returned an invalid total")
+		}
+		if total < 0 {
+			total = *page.Total
+			if total == 0 {
+				return errx.Internal("Jira create-field metadata is empty")
+			}
+		} else if *page.Total != total {
+			return errx.Internal("Jira create-field pagination changed its total")
+		}
+		if startAt >= total || len(page.Fields) == 0 || len(page.Fields) > *page.MaxResults || len(page.Fields) > pageSize {
+			return errx.Internal("Jira create-field pagination did not make valid progress")
+		}
+		next := startAt + len(page.Fields)
+		if next <= startAt || next > total || next > maxFields {
+			return errx.Internal("Jira create-field pagination overran its total")
+		}
+
+		for _, field := range page.Fields {
+			if field.FieldID == "" || len(field.FieldID) > maxFieldIDLen || !validMetadataIdentifier(field.FieldID) {
+				return errx.Internal("Jira create-field metadata contains an invalid field ID")
+			}
+			if _, exists := seen[field.FieldID]; exists {
+				return errx.Internal("Jira create-field metadata contains a duplicate field ID")
+			}
+			seen[field.FieldID] = struct{}{}
+			if field.Required == nil || field.Operations == nil {
+				return errx.Internal("Jira create-field metadata is incomplete")
+			}
+			supportsSet := false
+			for _, operation := range field.Operations {
+				if operation == "" || len(operation) > maxOperation || !validMetadataIdentifier(operation) {
+					return errx.Internal("Jira create-field metadata contains an invalid operation")
+				}
+				if operation == "set" {
+					supportsSet = true
+				}
+			}
+			hasDefault := field.HasDefaultValue != nil && *field.HasDefaultValue
+			if *field.Required && !provided[field.FieldID] && !hasDefault {
+				unsupported[field.FieldID] = struct{}{}
+				if field.FieldID == "description" && supportsSet {
+					provideDescription = true
+				}
+			}
+			if (field.FieldID == "summary" || field.FieldID == "description" && input.Description != nil) && !supportsSet {
+				unsupported[field.FieldID] = struct{}{}
+			}
+		}
+
+		startAt = next
+		if startAt == total {
+			break
+		}
+		if pageNumber == maxPages-1 {
+			return errx.Internal("Jira create-field pagination exceeded the safety limit")
+		}
+	}
+	if startAt != total {
+		return errx.Internal("Jira create-field pagination ended before its total")
+	}
+	if _, found := seen["summary"]; !found {
+		unsupported["summary"] = struct{}{}
+	}
+	if input.Description != nil {
+		if _, found := seen["description"]; !found {
+			unsupported["description"] = struct{}{}
+		}
+	}
+	if len(unsupported) == 0 {
+		return nil
+	}
+	fieldIDs := make([]string, 0, len(unsupported))
+	for fieldID := range unsupported {
+		fieldIDs = append(fieldIDs, fieldID)
+	}
+	return errx.CreateFieldsUnsupported(fieldIDs, provideDescription)
+}
+
+func validMetadataIdentifier(value string) bool {
+	for _, character := range value {
+		switch {
+		case character >= 'a' && character <= 'z':
+		case character >= 'A' && character <= 'Z':
+		case character >= '0' && character <= '9':
+		case character == '_', character == '-', character == '.', character == ':':
+		default:
+			return false
+		}
+	}
+	return value != ""
 }
 
 // EditIssue updates only summary and/or description on one numeric issue ID.

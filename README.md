@@ -120,10 +120,14 @@ write:attachment:jira
 
 Jira's [create-issue endpoint](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-post)
 requires `write:attachment:jira` even though `jira-cli` has no attachment
-command. Tokens cannot be modified after creation; create a replacement token
-when adding scopes, verify it with `auth login`, and revoke the old token only
-after the replacement works. Avoid the broader classic `write:jira-work` scope
-when this granular union is available.
+command. The classic `read:jira-work` scope also covers the create-screen
+metadata preflight. A fully granular read configuration needs
+`read:issue-meta:jira`, `read:avatar:jira`, and
+`read:field-configuration:jira` for that endpoint. Tokens cannot be modified
+after creation; create a replacement token when adding scopes, verify it with
+`auth login`, and revoke the old token only after the replacement works. Avoid
+the broader classic `write:jira-work` scope when this granular union is
+available.
 
 ### Write allowlist
 
@@ -212,10 +216,19 @@ contract.
 
 Before an actual mutation, `jira-cli` checks the identity-bound allowlist and
 re-reads exact canonical project, issue, issue-type, and transition identities
-as applicable. Writes use numeric Jira IDs, are attempted once, and never echo
-summary, description, or comment bodies in receipts. Exit 9 with
-`WRITE_OUTCOME_UNKNOWN` means the request may have succeeded; re-read Jira to
-reconcile it and do not repeat the write automatically.
+as applicable. Issue creation also fully reads Jira's create-screen metadata
+before the POST. If the selected project and type require a field that the
+bounded CLI cannot supply and Jira has no default for it, creation fails closed
+with `CREATE_FIELDS_UNSUPPORTED`; choose another standard type, change the Jira
+screen configuration, or create the issue in Jira. Do not work around this with
+raw fields or direct REST calls.
+
+`--dry-run` remains deliberately local and reports
+`remote_checks:"not_performed"`, so it cannot prove that current Jira screen
+metadata accepts the payload. Actual writes use numeric Jira IDs, are attempted
+once, and never echo summary, description, or comment bodies in receipts. Exit
+9 with `WRITE_OUTCOME_UNKNOWN` means the request may have succeeded; re-read
+Jira to reconcile it and do not repeat the write automatically.
 
 ## Agent Skill
 

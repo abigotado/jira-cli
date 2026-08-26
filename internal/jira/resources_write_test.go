@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -98,23 +99,6 @@ func TestWriteResourcesUseNumericIDRoutesAndExactPayloads(t *testing.T) {
 		assertBody func(*testing.T, map[string]any)
 	}{
 		{
-			name: "create uses project and issue type IDs with ADF description", method: http.MethodPost, path: "/rest/api/3/issue", status: http.StatusCreated, response: `{"id":"10001","key":"WL-7","self":"https://safe.invalid/10001"}`,
-			call: func(ctx context.Context, client *Client) error {
-				created, err := client.CreateIssue(ctx, CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description})
-				if err == nil && (created.ID != "10001" || created.Key != "WL-7") {
-					t.Fatalf("created = %#v", created)
-				}
-				return err
-			},
-			assertBody: func(t *testing.T, body map[string]any) {
-				fields := body["fields"].(map[string]any)
-				if fields["summary"] != "New issue" || fields["project"].(map[string]any)["id"] != "123" || fields["issuetype"].(map[string]any)["id"] != "456" {
-					t.Fatalf("fields = %#v", fields)
-				}
-				assertADFText(t, fields["description"], description)
-			},
-		},
-		{
 			name: "edit uses numeric issue ID and typed fields", method: http.MethodPut, path: "/rest/api/3/issue/10001", status: http.StatusNoContent, response: "",
 			call: func(ctx context.Context, client *Client) error {
 				return client.EditIssue(ctx, "10001", EditIssueRequest{Summary: &summary, Description: &description})
@@ -189,6 +173,201 @@ func TestWriteResourcesUseNumericIDRoutesAndExactPayloads(t *testing.T) {
 	}
 }
 
+func TestCreateIssueUsesExactPreflightSequenceAndPayload(t *testing.T) {
+	description := "line one\nстрока два"
+	type expectedRequest struct {
+		method string
+		path   string
+		query  string
+	}
+	wantRequests := []expectedRequest{
+		{method: http.MethodGet, path: "/rest/api/3/issue/createmeta/123/issuetypes", query: "maxResults=100"},
+		{method: http.MethodGet, path: "/rest/api/3/issue/createmeta/123/issuetypes/456", query: "maxResults=100&startAt=0"},
+		{method: http.MethodGet, path: "/rest/api/3/issue/createmeta/123/issuetypes/456", query: "maxResults=100&startAt=2"},
+		{method: http.MethodPost, path: "/rest/api/3/issue", query: ""},
+	}
+	responses := []string{
+		`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"456","name":"Task","subtask":false}]}`,
+		createFieldPageJSON(t, 0, 2, 4, []IssueCreateField{
+			createField("project", true, false, "set"),
+			createField("issuetype", true, false, "set"),
+		}),
+		createFieldPageJSON(t, 2, 2, 4, []IssueCreateField{
+			createField("summary", true, false, "set"),
+			createField("description", true, false, "set"),
+		}),
+		`{"id":"10001","key":"WL-7","self":"https://safe.invalid/10001"}`,
+	}
+	requestIndex := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if requestIndex >= len(wantRequests) {
+			t.Errorf("unexpected extra request: %s %s", request.Method, request.URL.String())
+			writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		want := wantRequests[requestIndex]
+		if request.Method != want.method || request.URL.Path != want.path || request.URL.RawQuery != want.query {
+			t.Errorf("request[%d] = %s %s?%s, want %s %s?%s", requestIndex, request.Method, request.URL.Path, request.URL.RawQuery, want.method, want.path, want.query)
+		}
+		if request.Method == http.MethodPost {
+			var body map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Errorf("decode create body: %v", err)
+			} else {
+				fields := body["fields"].(map[string]any)
+				if fields["summary"] != "New issue" || fields["project"].(map[string]any)["id"] != "123" || fields["issuetype"].(map[string]any)["id"] != "456" {
+					t.Errorf("fields = %#v", fields)
+				}
+				assertADFText(t, fields["description"], description)
+			}
+			writer.WriteHeader(http.StatusCreated)
+		}
+		_, _ = io.WriteString(writer, responses[requestIndex])
+		requestIndex++
+	}))
+	defer server.Close()
+
+	created, err := newTestClient(t, server).CreateIssue(context.Background(), CreateIssueRequest{
+		ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description,
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue() error = %v", err)
+	}
+	if created.ID != "10001" || created.Key != "WL-7" {
+		t.Fatalf("created = %#v", created)
+	}
+	if requestIndex != len(wantRequests) {
+		t.Fatalf("requests = %d, want %d", requestIndex, len(wantRequests))
+	}
+}
+
+func TestCreateIssueAcceptsOnlySupportedBoundedMetadata(t *testing.T) {
+	description := "bounded description"
+	tests := []struct {
+		name             string
+		input            CreateIssueRequest
+		pages            []string
+		wantCode         errx.Code
+		wantReason       string
+		wantHintContains string
+		wantPosts        int
+	}{
+		{
+			name:  "provided project issue type and summary are accepted",
+			input: CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue"},
+			pages: []string{createFieldPageJSON(t, 0, 100, 3, []IssueCreateField{
+				createField("project", true, false, "set"),
+				createField("issuetype", true, false, "set"),
+				createField("summary", true, false, "set"),
+			})},
+			wantPosts: 1,
+		},
+		{
+			name:  "required custom field with Jira default is accepted",
+			input: CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue"},
+			pages: []string{createFieldPageJSON(t, 0, 100, 2, []IssueCreateField{
+				createField("summary", true, false, "set"),
+				createField("customfield_10000", true, true, "set"),
+			})},
+			wantPosts: 1,
+		},
+		{
+			name:  "supplied description with set operation is accepted",
+			input: CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description},
+			pages: []string{createFieldPageJSON(t, 0, 100, 2, []IssueCreateField{
+				createField("summary", true, false, "set"),
+				createField("description", true, false, "set"),
+			})},
+			wantPosts: 1,
+		},
+		{
+			name:             "required omitted description without default is rejected",
+			input:            CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue"},
+			pages:            []string{createFieldPageJSON(t, 0, 100, 2, []IssueCreateField{createField("summary", true, false, "set"), createField("description", true, false, "set")})},
+			wantCode:         errx.CodeUsage,
+			wantReason:       "CREATE_FIELDS_UNSUPPORTED",
+			wantHintContains: "--description",
+		},
+		{
+			name:             "supplied description lacking exact set is rejected",
+			input:            CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description},
+			pages:            []string{createFieldPageJSON(t, 0, 100, 2, []IssueCreateField{createField("summary", true, false, "set"), createField("description", false, false, "add")})},
+			wantCode:         errx.CodeUsage,
+			wantReason:       "CREATE_FIELDS_UNSUPPORTED",
+			wantHintContains: "standard issue type",
+		},
+		{
+			name:             "supplied description missing from metadata is rejected",
+			input:            CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description},
+			pages:            []string{createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{createField("summary", true, false, "set")})},
+			wantCode:         errx.CodeUsage,
+			wantReason:       "CREATE_FIELDS_UNSUPPORTED",
+			wantHintContains: "standard issue type",
+		},
+		{
+			name:             "later page required blocker prevents write",
+			input:            CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue"},
+			pages:            []string{createFieldPageJSON(t, 0, 1, 2, []IssueCreateField{createField("summary", true, false, "set")}), createFieldPageJSON(t, 1, 1, 2, []IssueCreateField{createField("customfield_20000", true, false, "set")})},
+			wantCode:         errx.CodeUsage,
+			wantReason:       "CREATE_FIELDS_UNSUPPORTED",
+			wantHintContains: "standard issue type",
+		},
+		{
+			name:             "missing summary metadata prevents write",
+			input:            CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue"},
+			pages:            []string{createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{createField("project", true, false, "set")})},
+			wantCode:         errx.CodeUsage,
+			wantReason:       "CREATE_FIELDS_UNSUPPORTED",
+			wantHintContains: "standard issue type",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			metadataCalls := 0
+			postCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/rest/api/3/issue/createmeta/123/issuetypes":
+					_, _ = io.WriteString(writer, `{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"456","name":"Task","subtask":false}]}`)
+				case "/rest/api/3/issue/createmeta/123/issuetypes/456":
+					if metadataCalls >= len(test.pages) {
+						t.Errorf("unexpected metadata page %d", metadataCalls)
+						writer.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					_, _ = io.WriteString(writer, test.pages[metadataCalls])
+					metadataCalls++
+				case "/rest/api/3/issue":
+					postCalls++
+					writer.WriteHeader(http.StatusCreated)
+					_, _ = io.WriteString(writer, `{"id":"10001","key":"WL-1"}`)
+				default:
+					t.Errorf("unexpected request: %s %s", request.Method, request.URL.Path)
+					writer.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			_, err := newTestClient(t, server).CreateIssue(context.Background(), test.input)
+			if got := errx.ExitCode(err); got != test.wantCode {
+				t.Fatalf("exit code = %d, want %d (err=%v)", got, test.wantCode, err)
+			}
+			if test.wantReason != "" {
+				var typed *errx.Error
+				if !errors.As(err, &typed) || typed.Reason != test.wantReason {
+					t.Fatalf("error = %#v, want reason %s", typed, test.wantReason)
+				}
+				if !strings.Contains(typed.Hint, test.wantHintContains) {
+					t.Fatalf("hint = %q, want %q", typed.Hint, test.wantHintContains)
+				}
+			}
+			if metadataCalls != len(test.pages) || postCalls != test.wantPosts {
+				t.Fatalf("calls = metadata:%d post:%d, want metadata:%d post:%d", metadataCalls, postCalls, len(test.pages), test.wantPosts)
+			}
+		})
+	}
+}
+
 func TestWriteInputValidationMakesNoRequest(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
@@ -239,7 +418,7 @@ func TestIssueTypesUsesOffsetPagination(t *testing.T) {
 		if request.URL.Query().Get("startAt") != "10" || request.URL.Query().Get("maxResults") != "5" {
 			t.Errorf("query = %s", request.URL.RawQuery)
 		}
-		_, _ = writer.Write([]byte(`{"startAt":10,"maxResults":5,"total":20,"issueTypes":[{"id":"100","name":"Task"}]}`))
+		_, _ = writer.Write([]byte(`{"startAt":10,"maxResults":5,"total":20,"issueTypes":[{"id":"100","name":"Task","subtask":false}]}`))
 	}))
 	defer server.Close()
 	page, err := newTestClient(t, server).IssueTypes(context.Background(), "123", IssueTypePageOptions{StartAt: 10, MaxResults: 5})
@@ -260,19 +439,305 @@ func TestValidateIssueTypeUsesSpecificNotFoundContract(t *testing.T) {
 	}
 }
 
-func TestValidateIssueTypeRejectsSubtaskWithoutWrite(t *testing.T) {
+func TestIssueTypeDiscoveryRejectsAmbiguousWireDataBeforeCreatePreflightOrWrite(t *testing.T) {
+	const malformedSentinel = "ISSUE_TYPE_METADATA_SENTINEL"
+	standard := `{"id":"456","name":"Task","subtask":false}`
+	tests := []struct {
+		name      string
+		pages     []string
+		wantCalls int
+	}{
+		{name: "omitted subtask", pages: []string{`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"456","name":"Task"}]}`}, wantCalls: 1},
+		{name: "null subtask", pages: []string{`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"456","name":"Task","subtask":null}]}`}, wantCalls: 1},
+		{name: "omitted startAt", pages: []string{`{"maxResults":100,"total":1,"issueTypes":[` + standard + `]}`}, wantCalls: 1},
+		{name: "null startAt", pages: []string{`{"startAt":null,"maxResults":100,"total":1,"issueTypes":[` + standard + `]}`}, wantCalls: 1},
+		{name: "omitted maxResults", pages: []string{`{"startAt":0,"total":1,"issueTypes":[` + standard + `]}`}, wantCalls: 1},
+		{name: "null maxResults", pages: []string{`{"startAt":0,"maxResults":null,"total":1,"issueTypes":[` + standard + `]}`}, wantCalls: 1},
+		{name: "omitted total", pages: []string{`{"startAt":0,"maxResults":100,"issueTypes":[` + standard + `]}`}, wantCalls: 1},
+		{name: "null total", pages: []string{`{"startAt":0,"maxResults":100,"total":null,"issueTypes":[` + standard + `]}`}, wantCalls: 1},
+		{name: "omitted issueTypes", pages: []string{`{"startAt":0,"maxResults":100,"total":1}`}, wantCalls: 1},
+		{name: "null issueTypes", pages: []string{`{"startAt":0,"maxResults":100,"total":1,"issueTypes":null}`}, wantCalls: 1},
+		{name: "mismatched startAt", pages: []string{`{"startAt":1,"maxResults":100,"total":1,"issueTypes":[]}`}, wantCalls: 1},
+		{name: "zero page size", pages: []string{`{"startAt":0,"maxResults":0,"total":1,"issueTypes":[` + standard + `]}`}, wantCalls: 1},
+		{name: "page size exceeds cap", pages: []string{`{"startAt":0,"maxResults":101,"total":1,"issueTypes":[` + standard + `]}`}, wantCalls: 1},
+		{name: "negative total", pages: []string{`{"startAt":0,"maxResults":100,"total":-1,"issueTypes":[]}`}, wantCalls: 1},
+		{name: "total exceeds cap", pages: []string{`{"startAt":0,"maxResults":100,"total":10001,"issueTypes":[` + standard + `]}`}, wantCalls: 1},
+		{name: "page makes no progress", pages: []string{`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[]}`}, wantCalls: 1},
+		{name: "page overruns total", pages: []string{`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[` + standard + `,{"id":"789","name":"Bug","subtask":false}]}`}, wantCalls: 1},
+		{name: "duplicate IDs on one page", pages: []string{`{"startAt":0,"maxResults":100,"total":2,"issueTypes":[` + standard + `,{"id":"456","name":"Duplicate","subtask":false}]}`}, wantCalls: 1},
+		{name: "missing ID", pages: []string{`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"name":"Task","subtask":false}]}`}, wantCalls: 1},
+		{name: "null ID", pages: []string{`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":null,"name":"Task","subtask":false}]}`}, wantCalls: 1},
+		{name: "non numeric ID", pages: []string{`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"Task","name":"Task","subtask":false}]}`}, wantCalls: 1},
+		{
+			name: "total changes after matching ID",
+			pages: []string{
+				`{"startAt":0,"maxResults":1,"total":2,"issueTypes":[` + standard + `]}`,
+				`{"startAt":1,"maxResults":1,"total":3,"issueTypes":[{"id":"789","name":"Bug","subtask":false}]}`,
+			},
+			wantCalls: 2,
+		},
+		{
+			name: "duplicate ID appears after matching ID",
+			pages: []string{
+				`{"startAt":0,"maxResults":1,"total":2,"issueTypes":[` + standard + `]}`,
+				`{"startAt":1,"maxResults":1,"total":2,"issueTypes":[{"id":"456","name":"Duplicate","subtask":false}]}`,
+			},
+			wantCalls: 2,
+		},
+		{
+			name: "malformed later page after matching ID",
+			pages: []string{
+				`{"startAt":0,"maxResults":1,"total":2,"issueTypes":[` + standard + `]}`,
+				"not-json-" + malformedSentinel,
+			},
+			wantCalls: 2,
+		},
+	}
+	operations := []struct {
+		name string
+		call func(context.Context, *Client) error
+	}{
+		{name: "ValidateIssueType", call: func(ctx context.Context, client *Client) error {
+			return client.ValidateIssueType(ctx, "123", "456")
+		}},
+		{name: "CreateIssue", call: func(ctx context.Context, client *Client) error {
+			_, err := client.CreateIssue(ctx, CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "safe"})
+			return err
+		}},
+	}
+	for _, test := range tests {
+		for _, operation := range operations {
+			t.Run(test.name+"/"+operation.name, func(t *testing.T) {
+				typeCalls := 0
+				fieldMetadataCalls := 0
+				postCalls := 0
+				var logs bytes.Buffer
+				server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+					switch request.URL.Path {
+					case "/rest/api/3/issue/createmeta/123/issuetypes":
+						if typeCalls >= len(test.pages) {
+							t.Errorf("unexpected issue-type page %d", typeCalls)
+							writer.WriteHeader(http.StatusInternalServerError)
+							return
+						}
+						_, _ = io.WriteString(writer, test.pages[typeCalls])
+						typeCalls++
+					case "/rest/api/3/issue/createmeta/123/issuetypes/456":
+						fieldMetadataCalls++
+						_, _ = io.WriteString(writer, createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{createField("summary", true, false, "set")}))
+					case "/rest/api/3/issue":
+						postCalls++
+						writer.WriteHeader(http.StatusCreated)
+						_, _ = io.WriteString(writer, `{"id":"10001","key":"WL-1"}`)
+					default:
+						t.Errorf("unexpected request: %s %s", request.Method, request.URL.Path)
+						writer.WriteHeader(http.StatusNotFound)
+					}
+				}))
+				defer server.Close()
+				client := newTestClient(t, server, WithLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+				err := operation.call(context.Background(), client)
+				var typed *errx.Error
+				if !errors.As(err, &typed) || typed.Code != errx.CodeInternal || typed.Reason != "INTERNAL" {
+					t.Fatalf("error = %#v, want INTERNAL", typed)
+				}
+				if typeCalls != test.wantCalls || fieldMetadataCalls != 0 || postCalls != 0 {
+					t.Fatalf("calls = types:%d fields:%d post:%d, want types:%d fields:0 post:0", typeCalls, fieldMetadataCalls, postCalls, test.wantCalls)
+				}
+				combined := err.Error() + logs.String()
+				for _, sentinel := range []string{malformedSentinel, testToken, testEmail, "Authorization"} {
+					if strings.Contains(combined, sentinel) {
+						t.Fatalf("output leaked %q: %s", sentinel, combined)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestValidateIssueTypeScansEveryValidPageBeforeDeciding(t *testing.T) {
+	tests := []struct {
+		name      string
+		firstType string
+		wantCode  errx.Code
+	}{
+		{name: "standard target on first page succeeds after final page", firstType: `{"id":"456","name":"Task","subtask":false}`},
+		{name: "subtask target on first page is rejected after final page", firstType: `{"id":"456","name":"Subtask","subtask":true}`, wantCode: errx.CodeUsage},
+		{name: "absent target is not found after final page", firstType: `{"id":"111","name":"Story","subtask":false}`, wantCode: errx.CodeNotFound},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				startAt := request.URL.Query().Get("startAt")
+				switch calls {
+				case 0:
+					if startAt != "" {
+						t.Errorf("first startAt = %q, want omitted zero", startAt)
+					}
+					_, _ = io.WriteString(writer, `{"startAt":0,"maxResults":1,"total":2,"issueTypes":[`+test.firstType+`]}`)
+				case 1:
+					if startAt != "1" {
+						t.Errorf("second startAt = %q, want 1", startAt)
+					}
+					_, _ = io.WriteString(writer, `{"startAt":1,"maxResults":1,"total":2,"issueTypes":[{"id":"789","name":"Bug","subtask":false}]}`)
+				default:
+					t.Errorf("unexpected extra page %d", calls)
+					writer.WriteHeader(http.StatusInternalServerError)
+				}
+				calls++
+			}))
+			defer server.Close()
+			err := newTestClient(t, server).ValidateIssueType(context.Background(), "123", "456")
+			if got := errx.ExitCode(err); got != test.wantCode {
+				t.Fatalf("exit code = %d, want %d (err=%v)", got, test.wantCode, err)
+			}
+			if calls != 2 {
+				t.Fatalf("calls = %d, want all 2 pages", calls)
+			}
+		})
+	}
+}
+
+func TestCreateIssueRejectsSubtaskBeforeFieldMetadataOrWrite(t *testing.T) {
 	calls := 0
+	posts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		calls++
+		if request.Method == http.MethodPost {
+			posts++
+			writer.WriteHeader(http.StatusCreated)
+			return
+		}
 		if request.Method != http.MethodGet || request.URL.Path != "/rest/api/3/issue/createmeta/123/issuetypes" {
-			t.Fatalf("unexpected request = %s %s", request.Method, request.URL.Path)
+			t.Errorf("unexpected request = %s %s", request.Method, request.URL.Path)
+			writer.WriteHeader(http.StatusNotFound)
+			return
 		}
 		_, _ = writer.Write([]byte(`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"456","name":"Subtask","subtask":true}]}`))
 	}))
 	defer server.Close()
-	err := newTestClient(t, server).ValidateIssueType(context.Background(), "123", "456")
-	if errx.ExitCode(err) != errx.CodeUsage || calls != 1 {
-		t.Fatalf("error = %v calls = %d, want usage after one read", err, calls)
+	_, err := newTestClient(t, server).CreateIssue(context.Background(), CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "safe"})
+	if errx.ExitCode(err) != errx.CodeUsage || calls != 1 || posts != 0 {
+		t.Fatalf("error = %v calls = %d posts = %d, want usage after one read and no write", err, calls, posts)
+	}
+}
+
+func TestCreateIssueRejectsMalformedCreateMetadataWithoutWrite(t *testing.T) {
+	const metadataSentinel = "CREATE_METADATA_BODY_SENTINEL"
+	tests := []struct {
+		name          string
+		page          func(int) string
+		wantMetaCalls int
+	}{
+		{name: "missing fields array", page: func(int) string { return `{"startAt":0,"maxResults":100,"total":1}` }, wantMetaCalls: 1},
+		{name: "missing required pointer", page: func(int) string {
+			return `{"startAt":0,"maxResults":100,"total":1,"fields":[{"fieldId":"summary","operations":["set"],"hasDefaultValue":false}]}`
+		}, wantMetaCalls: 1},
+		{name: "empty metadata", page: func(int) string { return `{"startAt":0,"maxResults":100,"total":0,"fields":[]}` }, wantMetaCalls: 1},
+		{name: "malformed metadata", page: func(int) string { return "not-json-" + metadataSentinel }, wantMetaCalls: 1},
+		{name: "startAt mismatch", page: func(int) string {
+			return createFieldPageJSON(t, 1, 100, 1, []IssueCreateField{createField("summary", true, false, "set")})
+		}, wantMetaCalls: 1},
+		{name: "unstable total", page: func(call int) string {
+			if call == 0 {
+				return createFieldPageJSON(t, 0, 1, 2, []IssueCreateField{createField("summary", true, false, "set")})
+			}
+			return createFieldPageJSON(t, 1, 1, 3, []IssueCreateField{createField("project", true, false, "set")})
+		}, wantMetaCalls: 2},
+		{name: "negative total", page: func(int) string {
+			return createFieldPageJSON(t, 0, 100, -1, []IssueCreateField{createField("summary", true, false, "set")})
+		}, wantMetaCalls: 1},
+		{name: "page overruns total", page: func(int) string {
+			return createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{createField("summary", true, false, "set"), createField("project", true, false, "set")})
+		}, wantMetaCalls: 1},
+		{name: "page makes no progress", page: func(int) string { return createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{}) }, wantMetaCalls: 1},
+		{name: "field total exceeds cap", page: func(int) string {
+			return createFieldPageJSON(t, 0, 100, 10_001, []IssueCreateField{createField("summary", true, false, "set")})
+		}, wantMetaCalls: 1},
+		{name: "page count exceeds cap", page: func(call int) string {
+			return createFieldPageJSON(t, call, 1, 101, []IssueCreateField{createField("field_"+strconv.Itoa(call), false, false, "set")})
+		}, wantMetaCalls: 100},
+		{name: "missing field ID", page: func(int) string {
+			return createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{createField("", true, false, "set")})
+		}, wantMetaCalls: 1},
+		{name: "oversized field ID", page: func(int) string {
+			return createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{createField(strings.Repeat("f", 256), true, false, "set")})
+		}, wantMetaCalls: 1},
+		{name: "duplicate field ID", page: func(int) string {
+			return createFieldPageJSON(t, 0, 100, 2, []IssueCreateField{createField("summary", true, false, "set"), createField("summary", false, false, "set")})
+		}, wantMetaCalls: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			metaCalls := 0
+			postCalls := 0
+			var logs bytes.Buffer
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/rest/api/3/issue/createmeta/123/issuetypes":
+					_, _ = io.WriteString(writer, `{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"456","name":"Task","subtask":false}]}`)
+				case "/rest/api/3/issue/createmeta/123/issuetypes/456":
+					_, _ = io.WriteString(writer, test.page(metaCalls))
+					metaCalls++
+				case "/rest/api/3/issue":
+					postCalls++
+					writer.WriteHeader(http.StatusCreated)
+				default:
+					t.Errorf("unexpected request: %s %s", request.Method, request.URL.Path)
+					writer.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			client := newTestClient(t, server, WithLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+			_, err := client.CreateIssue(context.Background(), CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "safe"})
+			var typed *errx.Error
+			if !errors.As(err, &typed) || typed.Code != errx.CodeInternal || typed.Reason != "INTERNAL" {
+				t.Fatalf("error = %#v, want INTERNAL", typed)
+			}
+			if metaCalls != test.wantMetaCalls || postCalls != 0 {
+				t.Fatalf("calls = metadata:%d post:%d, want metadata:%d post:0", metaCalls, postCalls, test.wantMetaCalls)
+			}
+			combined := err.Error() + logs.String()
+			for _, sentinel := range []string{metadataSentinel, testToken, testEmail, "Authorization"} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("output leaked %q: %s", sentinel, combined)
+				}
+			}
+		})
+	}
+}
+
+func TestCreateIssueRetriesMetadataReadBeforeSingleWrite(t *testing.T) {
+	metadataCalls := 0
+	postCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/rest/api/3/issue/createmeta/123/issuetypes":
+			_, _ = io.WriteString(writer, `{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"456","name":"Task","subtask":false}]}`)
+		case "/rest/api/3/issue/createmeta/123/issuetypes/456":
+			metadataCalls++
+			if metadataCalls == 1 {
+				writer.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_, _ = io.WriteString(writer, createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{createField("summary", true, false, "set")}))
+		case "/rest/api/3/issue":
+			postCalls++
+			writer.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(writer, `{"id":"10001","key":"WL-1"}`)
+		default:
+			t.Errorf("unexpected request: %s %s", request.Method, request.URL.Path)
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	_, err := newTestClient(t, server).CreateIssue(context.Background(), CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "safe"})
+	if err != nil {
+		t.Fatalf("CreateIssue() error = %v", err)
+	}
+	if metadataCalls != 2 || postCalls != 1 {
+		t.Fatalf("calls = metadata:%d post:%d, want metadata:2 post:1", metadataCalls, postCalls)
 	}
 }
 
@@ -297,14 +762,26 @@ func TestWriteFailuresAreNeverRetriedAndHaveSafeOutcome(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			calls := 0
-			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-				calls++
-				writer.WriteHeader(test.status)
-				test.body(writer)
+			writeCalls := 0
+			var logs bytes.Buffer
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				switch request.URL.Path {
+				case "/rest/api/3/issue/createmeta/1/issuetypes":
+					_, _ = io.WriteString(writer, `{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"2","name":"Task","subtask":false}]}`)
+				case "/rest/api/3/issue/createmeta/1/issuetypes/2":
+					_, _ = io.WriteString(writer, createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{createField("summary", true, false, "set")}))
+				case "/rest/api/3/issue":
+					writeCalls++
+					writer.WriteHeader(test.status)
+					test.body(writer)
+				default:
+					t.Errorf("unexpected request: %s %s", request.Method, request.URL.Path)
+					writer.WriteHeader(http.StatusNotFound)
+				}
 			}))
 			defer server.Close()
-			_, err := newTestClient(t, server).CreateIssue(context.Background(), CreateIssueRequest{ProjectID: "1", IssueTypeID: "2", Summary: "safe summary"})
+			client := newTestClient(t, server, WithLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+			_, err := client.CreateIssue(context.Background(), CreateIssueRequest{ProjectID: "1", IssueTypeID: "2", Summary: "safe summary"})
 			if err == nil {
 				t.Fatal("expected error")
 			}
@@ -315,11 +792,14 @@ func TestWriteFailuresAreNeverRetriedAndHaveSafeOutcome(t *testing.T) {
 			if !errors.As(err, &typed) || typed.Reason != test.wantReason {
 				t.Fatalf("reason = %#v, want %q", typed, test.wantReason)
 			}
-			if calls != 1 {
-				t.Fatalf("calls = %d, want 1", calls)
+			if writeCalls != 1 {
+				t.Fatalf("write calls = %d, want exactly 1", writeCalls)
 			}
-			if combined := err.Error(); strings.Contains(combined, upstream) || strings.Contains(combined, testToken) || strings.Contains(combined, testEmail) {
-				t.Fatalf("error leaked sentinel: %s", combined)
+			combined := err.Error() + logs.String()
+			for _, sentinel := range []string{upstream, testToken, testEmail, "Authorization"} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("output leaked %q: %s", sentinel, combined)
+				}
 			}
 		})
 	}
@@ -412,6 +892,28 @@ func TestDispatchedWriteTransportAndTruncatedResponsesAreOutcomeUnknown(t *testi
 		})
 	}
 }
+
+func createField(fieldID string, required, hasDefault bool, operations ...string) IssueCreateField {
+	return IssueCreateField{
+		FieldID: fieldID, Operations: operations,
+		HasDefaultValue: boolPointer(hasDefault), Required: boolPointer(required),
+	}
+}
+
+func createFieldPageJSON(t *testing.T, startAt, maxResults, total int, fields []IssueCreateField) string {
+	t.Helper()
+	payload, err := json.Marshal(IssueCreateFieldPage{
+		StartAt: intPointer(startAt), MaxResults: intPointer(maxResults), Total: intPointer(total), Fields: fields,
+	})
+	if err != nil {
+		t.Fatalf("marshal create field page: %v", err)
+	}
+	return string(payload)
+}
+
+func boolPointer(value bool) *bool { return &value }
+
+func intPointer(value int) *int { return &value }
 
 func assertADFText(t *testing.T, raw any, want string) {
 	t.Helper()

@@ -94,9 +94,16 @@ receipts intentionally never echo their contents. Never add `--yes` merely to
 silence exit 7; it represents the user's approval after reviewing dry-run.
 
 An actual write performs remote identity preflights and uses bounded numeric
-IDs, then verifies the issue project again after success. The local allowlist
-is a target-selection rail; Jira account permissions are the hard
-authorization boundary. A write is attempted once. On exit 9 with
+IDs, then verifies the issue project again after success. Issue creation also
+fully checks Jira's create-screen field metadata before POST. On
+`CREATE_FIELDS_UNSUPPORTED`, follow the hint: provide the supported description
+when requested, choose or configure a standard issue type whose other required
+fields have Jira defaults, or create the issue in Jira. Never bypass the
+bounded command with raw fields, direct REST, another CLI, or browser
+automation.
+
+The local allowlist is a target-selection rail; Jira account permissions are
+the hard authorization boundary. A write is attempted once. On exit 9 with
 `WRITE_OUTCOME_UNKNOWN`, including a concurrent project move, do not retry the
 mutation: use read commands to reconcile whether it applied, then report the
 uncertainty to the user. For any other nonzero exit, follow the envelope's

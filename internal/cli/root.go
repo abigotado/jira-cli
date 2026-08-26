@@ -46,7 +46,6 @@ type jiraReader interface {
 type jiraMutationClient interface {
 	jiraReader
 	IssueTypes(context.Context, string, jira.IssueTypePageOptions) (jira.IssueTypePage, error)
-	ValidateIssueType(context.Context, string, string) error
 	CreateIssue(context.Context, jira.CreateIssueRequest) (jira.Issue, error)
 	EditIssue(context.Context, string, jira.EditIssueRequest) error
 	TransitionIssue(context.Context, string, string) error

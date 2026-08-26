@@ -221,6 +221,10 @@ func (a *App) newIssuesCreateCommand() *cobra.Command {
 			if err := validateOutputFields(a.fields, mutationReceiptFields); err != nil {
 				return err
 			}
+			input := jira.CreateIssueRequest{IssueTypeID: issueTypeID, Summary: summary}
+			if cmd.Flags().Changed("description") {
+				input.Description = &description
+			}
 			return a.runMutation(cmd.Context(), projectKey, "issues.create", func(client jiraMutationClient, _ profile.Profile) error {
 				receipt := mutationReceipt{Action: "issues.create", DryRun: a.dryRun, Applied: !a.dryRun, RemoteChecks: remoteCheckState(a.dryRun), Project: projectKey, IssueTypeID: issueTypeID}
 				if a.dryRun {
@@ -230,13 +234,7 @@ func (a *App) newIssuesCreateCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				if err := client.ValidateIssueType(cmd.Context(), project.ID, issueTypeID); err != nil {
-					return err
-				}
-				input := jira.CreateIssueRequest{ProjectID: project.ID, IssueTypeID: issueTypeID, Summary: summary}
-				if cmd.Flags().Changed("description") {
-					input.Description = &description
-				}
+				input.ProjectID = project.ID
 				created, err := client.CreateIssue(cmd.Context(), input)
 				if err != nil {
 					return err

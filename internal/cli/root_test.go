@@ -419,15 +419,12 @@ type fakeJira struct {
 	projectCalls       int
 	issueCalls         int
 	typeCalls          int
-	validateCalls      int
 	createCalls        int
 	editCalls          int
 	transitionCalls    int
 	commentCalls       int
-	validatedProjectID string
-	validatedTypeID    string
-	validateErr        error
 	createInput        jira.CreateIssueRequest
+	createErr          error
 	editIssueID        string
 	editInput          jira.EditIssueRequest
 	transitionIssueID  string
@@ -477,16 +474,10 @@ func (f *fakeJira) IssueTypes(_ context.Context, projectID string, options jira.
 	return f.issueTypes, nil
 }
 
-func (f *fakeJira) ValidateIssueType(_ context.Context, projectID, issueTypeID string) error {
-	f.validateCalls++
-	f.validatedProjectID, f.validatedTypeID = projectID, issueTypeID
-	return f.validateErr
-}
-
 func (f *fakeJira) CreateIssue(_ context.Context, input jira.CreateIssueRequest) (jira.Issue, error) {
 	f.createCalls++
 	f.createInput = input
-	return f.created, nil
+	return f.created, f.createErr
 }
 
 func (f *fakeJira) EditIssue(_ context.Context, issueID string, input jira.EditIssueRequest) error {

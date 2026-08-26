@@ -124,10 +124,47 @@ type IssueTypePage struct {
 	Values     []IssueType `json:"issueTypes"`
 }
 
+// issueTypeWire keeps presence information from Jira separate from the stable
+// public IssueType output model. Missing booleans must never silently become a
+// standard issue type.
+type issueTypeWire struct {
+	ID          *string `json:"id"`
+	Name        string  `json:"name"`
+	Description string  `json:"description,omitempty"`
+	Subtask     *bool   `json:"subtask"`
+}
+
+// issueTypePageWire distinguishes omitted pagination fields and issueTypes
+// from their legitimate zero and empty values.
+type issueTypePageWire struct {
+	StartAt    *int            `json:"startAt"`
+	MaxResults *int            `json:"maxResults"`
+	Total      *int            `json:"total"`
+	Values     []issueTypeWire `json:"issueTypes"`
+}
+
 // IssueTypePageOptions controls issue type pagination.
 type IssueTypePageOptions struct {
 	StartAt    int
 	MaxResults int
+}
+
+// IssueCreateField is the canonical subset of Jira create-field metadata
+// needed to decide whether jira-cli's bounded payload is supported.
+type IssueCreateField struct {
+	FieldID         string   `json:"fieldId"`
+	Operations      []string `json:"operations"`
+	HasDefaultValue *bool    `json:"hasDefaultValue"`
+	Required        *bool    `json:"required"`
+}
+
+// IssueCreateFieldPage is an offset-based create-field metadata page. Pointer
+// pagination fields distinguish a legitimate zero from an omitted field.
+type IssueCreateFieldPage struct {
+	StartAt    *int               `json:"startAt"`
+	MaxResults *int               `json:"maxResults"`
+	Total      *int               `json:"total"`
+	Fields     []IssueCreateField `json:"fields"`
 }
 
 // ADFDocument is the deliberately narrow Atlassian Document Format accepted

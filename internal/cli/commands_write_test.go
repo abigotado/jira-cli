@@ -215,10 +215,11 @@ func TestMutationCommandsPerformExactPreflightAndWriteOnce(t *testing.T) {
 			name: "create", args: []string{"issues", "create", "--project", "WL", "--issue-type-id", "456", "--summary", "New issue", "--description", description},
 			client: &fakeJira{project: jira.Project{ID: "123", Key: "WL"}, issue: jira.Issue{ID: "10001", Key: "WL-1"}, created: jira.Issue{ID: "10001", Key: "WL-1", Self: "https://safe.invalid/10001"}},
 			check: func(t *testing.T, client *fakeJira, receipt map[string]any) {
-				if client.projectCalls != 1 || client.validateCalls != 1 || client.createCalls != 1 || client.validatedProjectID != "123" || client.validatedTypeID != "456" {
+				if client.projectCalls != 1 || client.typeCalls != 0 || client.createCalls != 1 || client.issueCalls != 1 {
 					t.Fatalf("create preflight/calls = %#v", client)
 				}
-				if client.createInput.ProjectID != "123" || client.createInput.IssueTypeID != "456" || client.createInput.Description == nil || *client.createInput.Description != description {
+				want := jira.CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description}
+				if !reflect.DeepEqual(client.createInput, want) {
 					t.Fatalf("create input = %#v", client.createInput)
 				}
 				if receipt["issue_key"] != "WL-1" || receipt["issue_id"] != "10001" {
@@ -340,10 +341,10 @@ func TestMutationRejectsIncompleteWriteReceiptsAsUnknown(t *testing.T) {
 	}
 }
 
-func TestCreateRejectsSubtaskTypeBeforeWrite(t *testing.T) {
+func TestCreatePropagatesClientPreflightFailure(t *testing.T) {
 	client := &fakeJira{
-		project:     jira.Project{ID: "123", Key: "WL"},
-		validateErr: errx.Usage("subtask issue types are not supported; choose a standard issue type"),
+		project:   jira.Project{ID: "123", Key: "WL"},
+		createErr: errx.CreateFieldsUnsupported([]string{"customfield_10000"}, false),
 	}
 	app, stdout, _ := testApp(&fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}, client)
 	code := app.Run(context.Background(), app.NewRootCommand(), []string{
@@ -352,8 +353,10 @@ func TestCreateRejectsSubtaskTypeBeforeWrite(t *testing.T) {
 	if code != errx.CodeUsage {
 		t.Fatalf("code = %d, want usage stdout=%s", code, stdout.String())
 	}
-	if client.validateCalls != 1 || client.createCalls != 0 {
-		t.Fatalf("calls = validate:%d create:%d", client.validateCalls, client.createCalls)
+	assertErrorReason(t, stdout.Bytes(), "CREATE_FIELDS_UNSUPPORTED")
+	assertErrorHintContains(t, stdout.Bytes(), "standard issue type")
+	if client.createCalls != 1 || client.issueCalls != 0 {
+		t.Fatalf("calls = create:%d issue:%d, want one client operation and no reconciliation read", client.createCalls, client.issueCalls)
 	}
 }
 
@@ -379,7 +382,7 @@ func (f *fakeJira) totalMutationCalls() int {
 }
 
 func (f *fakeJira) totalCalls() int {
-	return f.projectCalls + f.issueCalls + f.typeCalls + f.validateCalls + f.totalMutationCalls()
+	return f.projectCalls + f.issueCalls + f.typeCalls + f.totalMutationCalls()
 }
 
 type fakePolicyRegistry struct {

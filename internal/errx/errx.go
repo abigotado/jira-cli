@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -151,6 +152,55 @@ func Inexact(kind, query string, candidates []Candidate) *Error {
 	}
 }
 
+// CreateFieldsUnsupported reports create metadata that cannot accept the
+// bounded jira-cli payload. Only canonical field IDs are exposed, with a
+// strict count and length bound; Jira field names and raw metadata never
+// become part of the public error.
+func CreateFieldsUnsupported(fieldIDs []string, provideDescription bool) *Error {
+	const (
+		maxReportedIDs  = 8
+		maxFieldIDBytes = 255
+	)
+	unique := make(map[string]struct{}, len(fieldIDs))
+	for _, fieldID := range fieldIDs {
+		if fieldID != "" {
+			unique[fieldID] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(unique))
+	for fieldID := range unique {
+		ordered = append(ordered, fieldID)
+	}
+	sort.Strings(ordered)
+
+	reported := make([]string, 0, min(len(ordered), maxReportedIDs))
+	omitted := 0
+	for _, fieldID := range ordered {
+		if len(reported) == maxReportedIDs || len(fieldID) > maxFieldIDBytes || !safeFieldID(fieldID) {
+			omitted++
+			continue
+		}
+		reported = append(reported, fieldID)
+	}
+	message := "Jira create metadata contains unsupported fields"
+	if len(reported) > 0 {
+		message += ": " + strings.Join(reported, ", ")
+	}
+	if omitted > 0 {
+		message += fmt.Sprintf(" (%d field IDs omitted)", omitted)
+	}
+	hint := "choose or configure a standard issue type so unsupported fields are optional or have Jira defaults"
+	if provideDescription && len(ordered) == 1 && ordered[0] == "description" {
+		hint = "re-run with --description to supply the required description field"
+	}
+	return &Error{
+		Code:    CodeUsage,
+		Reason:  "CREATE_FIELDS_UNSUPPORTED",
+		Message: message,
+		Hint:    hint,
+	}
+}
+
 // Auth reports missing, rejected, or expired Jira credentials.
 func Auth(reason, format string, args ...any) *Error {
 	return &Error{Code: CodeAuth, Reason: reason, Message: fmt.Sprintf(format, args...), Hint: "run 'jira-cli auth login --profile NAME' or rotate the API token"}
@@ -235,4 +285,18 @@ func upper(s string) string {
 
 func flagKind(kind string) string {
 	return strings.ReplaceAll(strings.ToLower(kind), "_", "-")
+}
+
+func safeFieldID(value string) bool {
+	for _, character := range value {
+		switch {
+		case character >= 'a' && character <= 'z':
+		case character >= 'A' && character <= 'Z':
+		case character >= '0' && character <= '9':
+		case character == '_', character == '-', character == '.', character == ':':
+		default:
+			return false
+		}
+	}
+	return value != ""
 }
