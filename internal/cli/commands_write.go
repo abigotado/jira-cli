@@ -39,10 +39,13 @@ func (a *App) newAuthAllowProjectsShowCommand() *cobra.Command {
 			if a.profileName == "" {
 				return errx.ProfileRequired()
 			}
+			if err := a.out.Validate(writePolicyView{}); err != nil {
+				return err
+			}
 			if a.registry == nil || a.policies == nil {
 				return errx.Internal("profile or write policy registry is unavailable")
 			}
-			return a.registry.WithProfileLock(cmd.Context(), a.profileName, func() error {
+			err := a.registry.WithProfileLock(cmd.Context(), a.profileName, func() error {
 				selected, err := a.registry.Get(cmd.Context(), a.profileName)
 				if err != nil {
 					return translateLocal(err, a.profileName)
@@ -59,6 +62,7 @@ func (a *App) newAuthAllowProjectsShowCommand() *cobra.Command {
 					return a.out.Success(newWritePolicyView(policy, state, false, false))
 				})
 			})
+			return translateLocalLockBoundary(err)
 		},
 	}
 }
@@ -70,15 +74,15 @@ func (a *App) newAuthAllowProjectsSetCommand() *cobra.Command {
 		Short: "Replace the exact projects allowed for writes",
 		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if a.profileName == "" {
+				return errx.ProfileRequired()
+			}
+			if err := a.out.Validate(writePolicyView{}); err != nil {
+				return err
+			}
 			canonical, err := writepolicy.CanonicalProjects(projects)
 			if err != nil {
 				return translateWritePolicy(err, a.profileName, "")
-			}
-			if err := validateOutputFields(a.fields, policyReceiptFields); err != nil {
-				return err
-			}
-			if a.profileName == "" {
-				return errx.ProfileRequired()
 			}
 			if !a.dryRun && !a.assumeYes {
 				return errx.ConfirmRequired("auth allow-projects set")
@@ -86,7 +90,7 @@ func (a *App) newAuthAllowProjectsSetCommand() *cobra.Command {
 			if a.registry == nil || a.policies == nil {
 				return errx.Internal("profile or write policy registry is unavailable")
 			}
-			return a.registry.WithProfileLock(cmd.Context(), a.profileName, func() error {
+			err = a.registry.WithProfileLock(cmd.Context(), a.profileName, func() error {
 				selected, err := a.registry.Get(cmd.Context(), a.profileName)
 				if err != nil {
 					return translateLocal(err, a.profileName)
@@ -96,12 +100,13 @@ func (a *App) newAuthAllowProjectsSetCommand() *cobra.Command {
 					if !a.dryRun {
 						policy, err = a.policies.Set(cmd.Context(), selected, canonical)
 						if err != nil {
-							return translateWritePolicy(err, selected.Name, "")
+							return translateWritePolicyLockBoundary(err, selected.Name)
 						}
 					}
 					return a.out.Success(newWritePolicyView(policy, "bound", a.dryRun, !a.dryRun))
 				})
 			})
+			return translateLocalLockBoundary(err)
 		},
 	}
 	command.Flags().StringArrayVar(&projects, "project", nil, "exact Jira project key to allow (repeatable)")
@@ -114,11 +119,11 @@ func (a *App) newAuthAllowProjectsClearCommand() *cobra.Command {
 		Short: "Remove the current profile's local write policy",
 		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := validateOutputFields(a.fields, policyReceiptFields); err != nil {
-				return err
-			}
 			if a.profileName == "" {
 				return errx.ProfileRequired()
+			}
+			if err := a.out.Validate(writePolicyView{}); err != nil {
+				return err
 			}
 			if !a.dryRun && !a.assumeYes {
 				return errx.ConfirmRequired("auth allow-projects clear")
@@ -126,7 +131,7 @@ func (a *App) newAuthAllowProjectsClearCommand() *cobra.Command {
 			if a.registry == nil || a.policies == nil {
 				return errx.Internal("profile or write policy registry is unavailable")
 			}
-			return a.registry.WithProfileLock(cmd.Context(), a.profileName, func() error {
+			err := a.registry.WithProfileLock(cmd.Context(), a.profileName, func() error {
 				selected, err := a.registry.Get(cmd.Context(), a.profileName)
 				if err != nil {
 					return translateLocal(err, a.profileName)
@@ -134,13 +139,14 @@ func (a *App) newAuthAllowProjectsClearCommand() *cobra.Command {
 				return a.policies.WithPolicyLock(cmd.Context(), a.profileName, func() error {
 					if !a.dryRun {
 						if err := a.policies.Clear(cmd.Context(), selected.Name); err != nil {
-							return translateWritePolicy(err, selected.Name, "")
+							return translateWritePolicyLockBoundary(err, selected.Name)
 						}
 					}
 					policy := writepolicy.Policy{Profile: selected.Name, Identity: writepolicy.IdentityFor(selected), Projects: []string{}}
 					return a.out.Success(newWritePolicyView(policy, "cleared", a.dryRun, !a.dryRun))
 				})
 			})
+			return translateLocalLockBoundary(err)
 		},
 	}
 }
@@ -201,6 +207,7 @@ func (a *App) newIssueTypesCommand() *cobra.Command {
 
 func (a *App) newIssuesCreateCommand() *cobra.Command {
 	var projectKey, issueTypeID, summary, description string
+	var labels []string
 	command := &cobra.Command{
 		Use:   "create",
 		Short: "Create one bounded issue in an allowed project",
@@ -215,13 +222,13 @@ func (a *App) newIssuesCreateCommand() *cobra.Command {
 			if err := jira.ValidateSummary(summary); err != nil {
 				return err
 			}
+			if err := jira.ValidateLabels(labels); err != nil {
+				return err
+			}
 			if _, err := jira.NewPlainTextDocument(description, "description"); err != nil && cmd.Flags().Changed("description") {
 				return err
 			}
-			if err := validateOutputFields(a.fields, mutationReceiptFields); err != nil {
-				return err
-			}
-			input := jira.CreateIssueRequest{IssueTypeID: issueTypeID, Summary: summary}
+			input := jira.CreateIssueRequest{IssueTypeID: issueTypeID, Summary: summary, Labels: append([]string(nil), labels...)}
 			if cmd.Flags().Changed("description") {
 				input.Description = &description
 			}
@@ -257,6 +264,7 @@ func (a *App) newIssuesCreateCommand() *cobra.Command {
 	flags.StringVar(&issueTypeID, "issue-type-id", "", "exact numeric issue type ID")
 	flags.StringVar(&summary, "summary", "", "bounded one-line issue summary")
 	flags.StringVar(&description, "description", "", "bounded plain-text description")
+	flags.StringArrayVar(&labels, "label", nil, "bounded Jira label (repeatable, maximum 100)")
 	return command
 }
 
@@ -288,9 +296,6 @@ func (a *App) newIssuesEditCommand() *cobra.Command {
 				if _, err := jira.NewPlainTextDocument(description, "description"); err != nil {
 					return err
 				}
-			}
-			if err := validateOutputFields(a.fields, mutationReceiptFields); err != nil {
-				return err
 			}
 			changed := make([]string, 0, 2)
 			if summaryChanged {
@@ -347,9 +352,6 @@ func (a *App) newIssuesTransitionCommand() *cobra.Command {
 			if err := requireNumericFlag(transitionID, "--transition-id"); err != nil {
 				return err
 			}
-			if err := validateOutputFields(a.fields, mutationReceiptFields); err != nil {
-				return err
-			}
 			return a.runMutation(cmd.Context(), projectKey, "issues.transition", func(client jiraMutationClient, _ profile.Profile) error {
 				receipt := mutationReceipt{Action: "issues.transition", DryRun: a.dryRun, Applied: !a.dryRun, RemoteChecks: remoteCheckState(a.dryRun), Project: projectKey, IssueKey: args[0], TransitionID: transitionID}
 				if a.dryRun {
@@ -404,9 +406,6 @@ func (a *App) newCommentsAddCommand() *cobra.Command {
 				return errx.Usage("--body must not be empty")
 			}
 			if _, err := jira.NewPlainTextDocument(body, "body"); err != nil {
-				return err
-			}
-			if err := validateOutputFields(a.fields, mutationReceiptFields); err != nil {
 				return err
 			}
 			return a.runMutation(cmd.Context(), projectKey, "comments.add", func(client jiraMutationClient, _ profile.Profile) error {
@@ -507,17 +506,14 @@ func requireNumericFlag(value, name string) error {
 	return nil
 }
 
-func validateOutputFields(fields, available []string) error {
-	set := make(map[string]struct{}, len(available))
-	for _, field := range available {
-		set[field] = struct{}{}
+func translateWritePolicyLockBoundary(err error, profileName string) error {
+	if writepolicy.WasCommitted(err) {
+		return translateWritePolicy(err, profileName, "")
 	}
-	for _, field := range fields {
-		if _, ok := set[field]; !ok {
-			return errx.Usage("unknown field %q: available are %s", field, strings.Join(available, ", "))
-		}
+	if isLockTimeout(err) {
+		return errx.LocalLockBusy().Wrap(err)
 	}
-	return nil
+	return translateWritePolicy(err, profileName, "")
 }
 
 func remoteCheckState(dryRun bool) string {
@@ -536,6 +532,3 @@ func standardIssueTypes(values []jira.IssueType) []jira.IssueType {
 	}
 	return supported
 }
-
-var mutationReceiptFields = []string{"action", "dry_run", "applied", "remote_checks", "project", "issue_key", "issue_id", "issue_type_id", "transition_id", "comment_id", "changed_fields", "self"}
-var policyReceiptFields = []string{"profile", "site", "email", "token_kind", "cloud_id", "projects", "state", "dry_run", "applied"}

@@ -170,6 +170,7 @@ type request struct {
 	body       any
 	policy     requestPolicy
 	operation  string
+	notFound   string
 	wantStatus int
 }
 
@@ -332,10 +333,14 @@ func (client *Client) translateStatus(response *http.Response, request request, 
 		return 0, false, errx.Permission("PERMISSION_DENIED", "the Jira account does not have permission for this operation")
 
 	case http.StatusNotFound:
-		if request.operation == "issues.transition" {
+		if request.policy == requestPolicyWrite {
 			return 0, false, writeConflict(request.operation)
 		}
-		return 0, false, errx.NotFound(resourceKind(request.path), "requested", nil)
+		kind := request.notFound
+		if kind == "" {
+			kind = resourceKind(request.path)
+		}
+		return 0, false, errx.NotFound(kind, "requested", nil)
 
 	case http.StatusConflict, http.StatusPreconditionFailed:
 		return 0, false, writeConflict(request.operation)
@@ -354,10 +359,10 @@ func (client *Client) translateStatus(response *http.Response, request request, 
 		return delay, true, errx.Retryable("RATE_LIMITED", delay, "Jira rate limit reached")
 
 	default:
+		if request.policy == requestPolicyWrite {
+			return 0, false, errx.WriteOutcomeUnknown(request.operation)
+		}
 		if response.StatusCode >= http.StatusInternalServerError {
-			if request.policy == requestPolicyWrite {
-				return 0, false, errx.WriteOutcomeUnknown(request.operation)
-			}
 			return 0, true, errx.Retryable("SERVER_ERROR", 0, "Jira is temporarily unavailable")
 		}
 		return 0, false, errx.Internal("Jira returned unexpected HTTP status %d", response.StatusCode)

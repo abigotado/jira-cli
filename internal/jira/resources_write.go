@@ -33,10 +33,11 @@ func (client *Client) IssueTypes(ctx context.Context, projectID string, options 
 	}
 	var wire issueTypePageWire
 	err := client.do(ctx, request{
-		method: http.MethodGet,
-		path:   "/rest/api/3/issue/createmeta/" + url.PathEscape(projectID) + "/issuetypes",
-		query:  query,
-		policy: requestPolicyRead,
+		method:   http.MethodGet,
+		path:     "/rest/api/3/issue/createmeta/" + url.PathEscape(projectID) + "/issuetypes",
+		query:    query,
+		policy:   requestPolicyRead,
+		notFound: "project",
 	}, &wire)
 	if err != nil {
 		return IssueTypePage{}, err
@@ -163,6 +164,9 @@ func (client *Client) CreateIssue(ctx context.Context, input CreateIssueRequest)
 	if err := ValidateSummary(input.Summary); err != nil {
 		return Issue{}, err
 	}
+	if err := ValidateLabels(input.Labels); err != nil {
+		return Issue{}, err
+	}
 	type identity struct {
 		ID string `json:"id"`
 	}
@@ -171,9 +175,11 @@ func (client *Client) CreateIssue(ctx context.Context, input CreateIssueRequest)
 		IssueType   identity     `json:"issuetype"`
 		Summary     string       `json:"summary"`
 		Description *ADFDocument `json:"description,omitempty"`
+		Labels      []string     `json:"labels,omitempty"`
 	}
 	payload := fields{
 		Project: identity{ID: input.ProjectID}, IssueType: identity{ID: input.IssueTypeID}, Summary: input.Summary,
+		Labels: append([]string(nil), input.Labels...),
 	}
 	if input.Description != nil {
 		document, err := NewPlainTextDocument(*input.Description, "description")
@@ -216,10 +222,14 @@ func (client *Client) validateCreateFields(ctx context.Context, input CreateIssu
 	if input.Description != nil {
 		provided["description"] = true
 	}
+	if len(input.Labels) > 0 {
+		provided["labels"] = true
+	}
 
 	seen := make(map[string]struct{})
 	unsupported := make(map[string]struct{})
 	provideDescription := false
+	provideLabels := false
 	startAt := 0
 	total := -1
 	for pageNumber := 0; pageNumber < maxPages; pageNumber++ {
@@ -230,7 +240,7 @@ func (client *Client) validateCreateFields(ctx context.Context, input CreateIssu
 		if err := client.do(ctx, request{
 			method: http.MethodGet,
 			path:   "/rest/api/3/issue/createmeta/" + url.PathEscape(input.ProjectID) + "/issuetypes/" + url.PathEscape(input.IssueTypeID),
-			query:  query, policy: requestPolicyRead,
+			query:  query, policy: requestPolicyRead, notFound: "issue type",
 		}, &page); err != nil {
 			return err
 		}
@@ -288,8 +298,13 @@ func (client *Client) validateCreateFields(ctx context.Context, input CreateIssu
 				if field.FieldID == "description" && supportsSet {
 					provideDescription = true
 				}
+				if field.FieldID == "labels" && supportsSet {
+					provideLabels = true
+				}
 			}
-			if (field.FieldID == "summary" || field.FieldID == "description" && input.Description != nil) && !supportsSet {
+			if (field.FieldID == "summary" ||
+				field.FieldID == "description" && input.Description != nil ||
+				field.FieldID == "labels" && len(input.Labels) > 0) && !supportsSet {
 				unsupported[field.FieldID] = struct{}{}
 			}
 		}
@@ -313,6 +328,11 @@ func (client *Client) validateCreateFields(ctx context.Context, input CreateIssu
 			unsupported["description"] = struct{}{}
 		}
 	}
+	if len(input.Labels) > 0 {
+		if _, found := seen["labels"]; !found {
+			unsupported["labels"] = struct{}{}
+		}
+	}
 	if len(unsupported) == 0 {
 		return nil
 	}
@@ -320,7 +340,7 @@ func (client *Client) validateCreateFields(ctx context.Context, input CreateIssu
 	for fieldID := range unsupported {
 		fieldIDs = append(fieldIDs, fieldID)
 	}
-	return errx.CreateFieldsUnsupported(fieldIDs, provideDescription)
+	return errx.CreateFieldsUnsupported(fieldIDs, provideDescription, provideLabels)
 }
 
 func validMetadataIdentifier(value string) bool {

@@ -86,6 +86,45 @@ func TestValidateSummaryUsesRuneBoundsAndSingleLineContract(t *testing.T) {
 	}
 }
 
+func TestValidateLabelsPreservesExactBoundedValues(t *testing.T) {
+	maximumLabels := make([]string, maxLabels)
+	for index := range maximumLabels {
+		maximumLabels[index] = "label-" + strconv.Itoa(index)
+	}
+	tests := []struct {
+		name     string
+		labels   []string
+		wantCode errx.Code
+	}{
+		{name: "empty list is accepted"},
+		{name: "order case and Unicode are accepted", labels: []string{"Zulu", "alpha", "Música", "zulu"}},
+		{name: "maximum count is accepted", labels: maximumLabels},
+		{name: "one beyond maximum count is rejected", labels: append(append([]string(nil), maximumLabels...), "overflow"), wantCode: errx.CodeUsage},
+		{name: "maximum rune count is accepted", labels: []string{strings.Repeat("界", maxLabelRunes)}},
+		{name: "one beyond rune limit is rejected", labels: []string{strings.Repeat("界", maxLabelRunes+1)}, wantCode: errx.CodeUsage},
+		{name: "empty value is rejected", labels: []string{""}, wantCode: errx.CodeUsage},
+		{name: "invalid UTF-8 is rejected", labels: []string{string([]byte{0xff})}, wantCode: errx.CodeUsage},
+		{name: "ASCII space is rejected", labels: []string{"two words"}, wantCode: errx.CodeUsage},
+		{name: "Unicode whitespace is rejected", labels: []string{"two\u00a0words"}, wantCode: errx.CodeUsage},
+		{name: "control character is rejected", labels: []string{"before\u0007after"}, wantCode: errx.CodeUsage},
+		{name: "line separator is rejected", labels: []string{"before\u2028after"}, wantCode: errx.CodeUsage},
+		{name: "paragraph separator is rejected", labels: []string{"before\u2029after"}, wantCode: errx.CodeUsage},
+		{name: "exact duplicate is rejected", labels: []string{"Alpha", "Alpha"}, wantCode: errx.CodeUsage},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			original := append([]string(nil), test.labels...)
+			err := ValidateLabels(test.labels)
+			if got := errx.ExitCode(err); got != test.wantCode {
+				t.Fatalf("exit code = %d, want %d (err=%v)", got, test.wantCode, err)
+			}
+			if !reflect.DeepEqual(test.labels, original) {
+				t.Fatalf("labels were normalized: got %#v, want %#v", test.labels, original)
+			}
+		})
+	}
+}
+
 func TestWriteResourcesUseNumericIDRoutesAndExactPayloads(t *testing.T) {
 	description := "line one\nстрока два"
 	summary := "Updated summary"
@@ -175,6 +214,7 @@ func TestWriteResourcesUseNumericIDRoutesAndExactPayloads(t *testing.T) {
 
 func TestCreateIssueUsesExactPreflightSequenceAndPayload(t *testing.T) {
 	description := "line one\nстрока два"
+	labels := []string{"Release-Ready", "música", "alpha"}
 	type expectedRequest struct {
 		method string
 		path   string
@@ -188,13 +228,14 @@ func TestCreateIssueUsesExactPreflightSequenceAndPayload(t *testing.T) {
 	}
 	responses := []string{
 		`{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"456","name":"Task","subtask":false}]}`,
-		createFieldPageJSON(t, 0, 2, 4, []IssueCreateField{
+		createFieldPageJSON(t, 0, 3, 5, []IssueCreateField{
 			createField("project", true, false, "set"),
 			createField("issuetype", true, false, "set"),
 		}),
-		createFieldPageJSON(t, 2, 2, 4, []IssueCreateField{
+		createFieldPageJSON(t, 2, 3, 5, []IssueCreateField{
 			createField("summary", true, false, "set"),
 			createField("description", true, false, "set"),
+			createField("labels", false, false, "set"),
 		}),
 		`{"id":"10001","key":"WL-7","self":"https://safe.invalid/10001"}`,
 	}
@@ -219,6 +260,10 @@ func TestCreateIssueUsesExactPreflightSequenceAndPayload(t *testing.T) {
 					t.Errorf("fields = %#v", fields)
 				}
 				assertADFText(t, fields["description"], description)
+				gotLabels, ok := fields["labels"].([]any)
+				if !ok || !reflect.DeepEqual(gotLabels, []any{"Release-Ready", "música", "alpha"}) {
+					t.Errorf("labels = %#v, want exact ordered values", fields["labels"])
+				}
 			}
 			writer.WriteHeader(http.StatusCreated)
 		}
@@ -228,7 +273,7 @@ func TestCreateIssueUsesExactPreflightSequenceAndPayload(t *testing.T) {
 	defer server.Close()
 
 	created, err := newTestClient(t, server).CreateIssue(context.Background(), CreateIssueRequest{
-		ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description,
+		ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description, Labels: labels,
 	})
 	if err != nil {
 		t.Fatalf("CreateIssue() error = %v", err)
@@ -251,6 +296,7 @@ func TestCreateIssueAcceptsOnlySupportedBoundedMetadata(t *testing.T) {
 		wantReason       string
 		wantHintContains string
 		wantPosts        int
+		wantLabels       []string
 	}{
 		{
 			name:  "provided project issue type and summary are accepted",
@@ -279,6 +325,60 @@ func TestCreateIssueAcceptsOnlySupportedBoundedMetadata(t *testing.T) {
 				createField("description", true, false, "set"),
 			})},
 			wantPosts: 1,
+		},
+		{
+			name:  "supplied labels with set operation preserve order",
+			input: CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Labels: []string{"Zulu", "alpha", "Música"}},
+			pages: []string{createFieldPageJSON(t, 0, 100, 2, []IssueCreateField{
+				createField("summary", true, false, "set"),
+				createField("labels", false, false, "set"),
+			})},
+			wantPosts:  1,
+			wantLabels: []string{"Zulu", "alpha", "Música"},
+		},
+		{
+			name:  "required omitted labels with Jira default are accepted",
+			input: CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue"},
+			pages: []string{createFieldPageJSON(t, 0, 100, 2, []IssueCreateField{
+				createField("summary", true, false, "set"),
+				createField("labels", true, true, "set"),
+			})},
+			wantPosts: 1,
+		},
+		{
+			name:             "required omitted labels without default are rejected",
+			input:            CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue"},
+			pages:            []string{createFieldPageJSON(t, 0, 100, 2, []IssueCreateField{createField("summary", true, false, "set"), createField("labels", true, false, "set")})},
+			wantCode:         errx.CodeUsage,
+			wantReason:       "CREATE_FIELDS_UNSUPPORTED",
+			wantHintContains: "--label",
+		},
+		{
+			name:             "supplied labels missing from metadata are rejected",
+			input:            CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Labels: []string{"safe"}},
+			pages:            []string{createFieldPageJSON(t, 0, 100, 1, []IssueCreateField{createField("summary", true, false, "set")})},
+			wantCode:         errx.CodeUsage,
+			wantReason:       "CREATE_FIELDS_UNSUPPORTED",
+			wantHintContains: "standard issue type",
+		},
+		{
+			name:             "supplied labels with add only operation are rejected",
+			input:            CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Labels: []string{"safe"}},
+			pages:            []string{createFieldPageJSON(t, 0, 100, 2, []IssueCreateField{createField("summary", true, false, "set"), createField("labels", false, false, "add")})},
+			wantCode:         errx.CodeUsage,
+			wantReason:       "CREATE_FIELDS_UNSUPPORTED",
+			wantHintContains: "standard issue type",
+		},
+		{
+			name:  "later page required labels blocker prevents write",
+			input: CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue"},
+			pages: []string{
+				createFieldPageJSON(t, 0, 1, 2, []IssueCreateField{createField("summary", true, false, "set")}),
+				createFieldPageJSON(t, 1, 1, 2, []IssueCreateField{createField("labels", true, false, "set")}),
+			},
+			wantCode:         errx.CodeUsage,
+			wantReason:       "CREATE_FIELDS_UNSUPPORTED",
+			wantHintContains: "--label",
 		},
 		{
 			name:             "required omitted description without default is rejected",
@@ -339,6 +439,23 @@ func TestCreateIssueAcceptsOnlySupportedBoundedMetadata(t *testing.T) {
 					metadataCalls++
 				case "/rest/api/3/issue":
 					postCalls++
+					var body struct {
+						Fields map[string]json.RawMessage `json:"fields"`
+					}
+					if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+						t.Errorf("decode create payload: %v", err)
+					}
+					labelsJSON, present := body.Fields["labels"]
+					if test.wantLabels == nil {
+						if present {
+							t.Errorf("labels unexpectedly present in payload: %s", labelsJSON)
+						}
+					} else {
+						var got []string
+						if !present || json.Unmarshal(labelsJSON, &got) != nil || !reflect.DeepEqual(got, test.wantLabels) {
+							t.Errorf("labels = %#v, present=%v, want %#v", got, present, test.wantLabels)
+						}
+					}
 					writer.WriteHeader(http.StatusCreated)
 					_, _ = io.WriteString(writer, `{"id":"10001","key":"WL-1"}`)
 				default:
@@ -755,6 +872,15 @@ func TestWriteFailuresAreNeverRetriedAndHaveSafeOutcome(t *testing.T) {
 		{name: "413 is bounded usage failure", status: http.StatusRequestEntityTooLarge, body: func(w http.ResponseWriter) { _, _ = io.WriteString(w, upstream) }, wantCode: errx.CodeUsage, wantReason: "PAYLOAD_TOO_LARGE"},
 		{name: "429 is not retried", status: http.StatusTooManyRequests, body: func(w http.ResponseWriter) { _, _ = io.WriteString(w, upstream) }, wantCode: errx.CodeRetryable, wantReason: "RATE_LIMITED"},
 		{name: "500 has unknown write outcome", status: http.StatusInternalServerError, body: func(w http.ResponseWriter) { _, _ = io.WriteString(w, upstream) }, wantCode: errx.CodeConflict, wantReason: "WRITE_OUTCOME_UNKNOWN"},
+		{name: "302 has unknown write outcome", status: http.StatusFound, body: func(w http.ResponseWriter) {
+			w.Header().Set("Location", "/redirect-target")
+			_, _ = io.WriteString(w, upstream)
+		}, wantCode: errx.CodeConflict, wantReason: "WRITE_OUTCOME_UNKNOWN"},
+		{name: "303 has unknown write outcome", status: http.StatusSeeOther, body: func(w http.ResponseWriter) {
+			w.Header().Set("Location", "/redirect-target")
+			_, _ = io.WriteString(w, upstream)
+		}, wantCode: errx.CodeConflict, wantReason: "WRITE_OUTCOME_UNKNOWN"},
+		{name: "unmapped 4xx has unknown write outcome", status: http.StatusTeapot, body: func(w http.ResponseWriter) { _, _ = io.WriteString(w, upstream) }, wantCode: errx.CodeConflict, wantReason: "WRITE_OUTCOME_UNKNOWN"},
 		{name: "empty 2xx has unknown write outcome", status: http.StatusCreated, body: func(http.ResponseWriter) {}, wantCode: errx.CodeConflict, wantReason: "WRITE_OUTCOME_UNKNOWN"},
 		{name: "unexpected 2xx has unknown write outcome", status: http.StatusOK, body: func(w http.ResponseWriter) { _, _ = io.WriteString(w, `{"id":"10001","key":"WL-1"}`) }, wantCode: errx.CodeConflict, wantReason: "WRITE_OUTCOME_UNKNOWN"},
 		{name: "invalid 2xx has unknown write outcome", status: http.StatusCreated, body: func(w http.ResponseWriter) { _, _ = io.WriteString(w, "not-json-"+upstream) }, wantCode: errx.CodeConflict, wantReason: "WRITE_OUTCOME_UNKNOWN"},
@@ -800,6 +926,88 @@ func TestWriteFailuresAreNeverRetriedAndHaveSafeOutcome(t *testing.T) {
 				if strings.Contains(combined, sentinel) {
 					t.Fatalf("output leaked %q: %s", sentinel, combined)
 				}
+			}
+		})
+	}
+}
+
+func TestWriteNotFoundStatusesAreOperationConflictsAndNeverRetried(t *testing.T) {
+	tests := []struct {
+		name       string
+		wantReason string
+		call       func(context.Context, *Client) error
+	}{
+		{name: "edit", wantReason: "ISSUE_EDIT_CONFLICT", call: func(ctx context.Context, client *Client) error {
+			summary := "updated"
+			return client.EditIssue(ctx, "10001", EditIssueRequest{Summary: &summary})
+		}},
+		{name: "transition", wantReason: "TRANSITION_CONFLICT", call: func(ctx context.Context, client *Client) error {
+			return client.TransitionIssue(ctx, "10001", "31")
+		}},
+		{name: "comment", wantReason: "COMMENT_CONFLICT", call: func(ctx context.Context, client *Client) error {
+			_, err := client.AddComment(ctx, "10001", "safe")
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				calls++
+				writer.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(writer, "UPSTREAM_BODY_SENTINEL")
+			}))
+			defer server.Close()
+			err := test.call(context.Background(), newTestClient(t, server))
+			var typed *errx.Error
+			if !errors.As(err, &typed) || typed.Code != errx.CodeConflict || typed.Reason != test.wantReason {
+				t.Fatalf("error = %#v, want %s", typed, test.wantReason)
+			}
+			if calls != 1 {
+				t.Fatalf("calls = %d, want exactly 1", calls)
+			}
+			if strings.Contains(err.Error(), "UPSTREAM_BODY_SENTINEL") {
+				t.Fatalf("error leaked upstream body: %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateMetadataNotFoundNamesExactResourceAndNeverWrites(t *testing.T) {
+	tests := []struct {
+		name       string
+		failPath   string
+		wantReason string
+		wantReads  int
+	}{
+		{name: "issue type list 404 means project not found", failPath: "/rest/api/3/issue/createmeta/123/issuetypes", wantReason: "NOT_FOUND_PROJECT", wantReads: 1},
+		{name: "field metadata 404 means issue type not found", failPath: "/rest/api/3/issue/createmeta/123/issuetypes/456", wantReason: "NOT_FOUND_ISSUE_TYPE", wantReads: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reads := 0
+			posts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.Method == http.MethodPost {
+					posts++
+					writer.WriteHeader(http.StatusCreated)
+					return
+				}
+				reads++
+				if request.URL.Path == test.failPath {
+					writer.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_, _ = io.WriteString(writer, `{"startAt":0,"maxResults":100,"total":1,"issueTypes":[{"id":"456","name":"Task","subtask":false}]}`)
+			}))
+			defer server.Close()
+			_, err := newTestClient(t, server).CreateIssue(context.Background(), CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "safe"})
+			var typed *errx.Error
+			if !errors.As(err, &typed) || typed.Code != errx.CodeNotFound || typed.Reason != test.wantReason {
+				t.Fatalf("error = %#v, want %s", typed, test.wantReason)
+			}
+			if reads != test.wantReads || posts != 0 {
+				t.Fatalf("calls = reads:%d posts:%d, want reads:%d posts:0", reads, posts, test.wantReads)
 			}
 		})
 	}

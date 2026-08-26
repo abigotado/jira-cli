@@ -106,12 +106,15 @@ func TestCreateFieldsUnsupportedIsDeterministicBoundedAndActionable(t *testing.T
 	const (
 		genericHint     = "choose or configure a standard issue type so unsupported fields are optional or have Jira defaults"
 		descriptionHint = "re-run with --description to supply the required description field"
+		labelsHint      = "re-run with at least one --label to supply the required labels field"
+		bothHint        = "re-run with --description and at least one --label to supply the required description and labels fields"
 	)
 	maxLengthID := strings.Repeat("a", 255)
 	tests := []struct {
 		name               string
 		fieldIDs           []string
 		provideDescription bool
+		provideLabels      bool
 		wantMessage        string
 		wantHint           string
 		absent             []string
@@ -121,6 +124,18 @@ func TestCreateFieldsUnsupportedIsDeterministicBoundedAndActionable(t *testing.T
 			fieldIDs: []string{"description"}, provideDescription: true,
 			wantMessage: "Jira create metadata contains unsupported fields: description",
 			wantHint:    descriptionHint,
+		},
+		{
+			name:     "labels alone offers the repeated bounded flag",
+			fieldIDs: []string{"labels"}, provideLabels: true,
+			wantMessage: "Jira create metadata contains unsupported fields: labels",
+			wantHint:    labelsHint,
+		},
+		{
+			name:     "description and labels offer both bounded flags",
+			fieldIDs: []string{"labels", "description"}, provideDescription: true, provideLabels: true,
+			wantMessage: "Jira create metadata contains unsupported fields: description, labels",
+			wantHint:    bothHint,
 		},
 		{
 			name:     "field IDs are sorted and deduplicated",
@@ -148,7 +163,7 @@ func TestCreateFieldsUnsupportedIsDeterministicBoundedAndActionable(t *testing.T
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := CreateFieldsUnsupported(test.fieldIDs, test.provideDescription)
+			err := CreateFieldsUnsupported(test.fieldIDs, test.provideDescription, test.provideLabels)
 			if err.Code != CodeUsage || ExitCode(err) != CodeUsage || err.Reason != "CREATE_FIELDS_UNSUPPORTED" {
 				t.Fatalf("contract = code:%d exit:%d reason:%q", err.Code, ExitCode(err), err.Reason)
 			}
@@ -164,6 +179,16 @@ func TestCreateFieldsUnsupportedIsDeterministicBoundedAndActionable(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+func TestLocalLockBusyHasStableRetryContract(t *testing.T) {
+	err := LocalLockBusy()
+	if err.Code != CodeRetryable || ExitCode(err) != CodeRetryable || err.Reason != "LOCAL_LOCK_BUSY" {
+		t.Fatalf("contract = code:%d exit:%d reason:%q", err.Code, ExitCode(err), err.Reason)
+	}
+	if err.RetryAfter != 0 || !strings.Contains(err.Hint, "retry") {
+		t.Fatalf("retry guidance = %#v", err)
 	}
 }
 

@@ -35,7 +35,7 @@ Each status maps to a distinct caller recovery action.
 | 3 | `NOT_FOUND` | object not found or not visible | check the key and profile |
 | 4 | `AMBIGUOUS` | several objects matched | pick from candidates |
 | 5 | `AUTH` | missing, expired, or rejected credentials | log in or rotate the API token |
-| 6 | `RETRYABLE` | rate limit or transient network failure | back off and retry safely |
+| 6 | `RETRYABLE` | transient rate-limit, read-transport, timeout, or local-lock failure | follow the hint, then retry safely |
 | 7 | `CONFIRMATION_REQUIRED` | write was not confirmed | obtain approval, then add --yes |
 | 8 | `PERMISSION_DENIED` | Jira permission or token scope denied | request permission or scope; do not retry unchanged |
 | 9 | `CONFLICT` | stale state or write conflict | re-read the issue or transition before deciding |

@@ -139,6 +139,34 @@ func TestProjectionValidationAndShape(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidProjectionBeforeRendering(t *testing.T) {
+	tests := []struct {
+		name   string
+		format Format
+		fields []string
+		data   any
+		want   errx.Code
+	}{
+		{name: "known object field", format: FormatJSON, fields: []string{"key"}, data: issue{}},
+		{name: "known empty collection field", format: FormatJSON, fields: []string{"key"}, data: []issue{}},
+		{name: "unknown field", format: FormatJSON, fields: []string{"authorization"}, data: issue{}, want: errx.CodeUsage},
+		{name: "raw with fields", format: FormatRaw, fields: []string{"key"}, data: issue{}, want: errx.CodeUsage},
+		{name: "non field payload", format: FormatJSON, fields: []string{"key"}, data: struct{ Key string }{}, want: errx.CodeUsage},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			w, stdout, stderr := writer(test.format, test.fields)
+			err := w.Validate(test.data)
+			if got := errx.ExitCode(err); got != test.want {
+				t.Fatalf("exit code = %d, want %d (err=%v)", got, test.want, err)
+			}
+			if stdout.Len() != 0 || stderr.Len() != 0 {
+				t.Fatalf("validation rendered output: stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
 func TestConcreteSliceAndObjectShapesAreStable(t *testing.T) {
 	tests := []struct {
 		name      string

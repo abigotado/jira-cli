@@ -30,7 +30,8 @@ cli → {output, auth, profile, writepolicy, skills, jira} → errx
 writepolicy → {profile, lockfile}
 ```
 
-Four invariants, verified with `go list -deps` rather than by eye:
+Four dependency invariants are verified with `go list -deps` rather than by
+eye:
 
 - **`internal/jira` must not import `internal/auth`.** Credentials arrive as
   a value in the client constructor. Importing `auth` inverts the arrow and
@@ -40,9 +41,14 @@ Four invariants, verified with `go list -deps` rather than by eye:
   import here is what turns the bottom of the stack into a cycle.
 - **`internal/cli` never calls `net/http`.** If a command needs a request that
   the client does not expose, add the method to `internal/jira`.
-- **Profile and write-policy locks have one order.** A flow that needs both
-  acquires the profile lock before the write-policy lock. Reversing that order
-  can deadlock concurrent login, policy, and mutation commands.
+- **`internal/writepolicy` must not import `internal/auth` or `internal/jira`.**
+  Policy storage is local, identity-bound state; it neither reads credentials
+  nor contacts Jira.
+
+Lock ordering is a reviewed convention rather than an import-graph invariant:
+a flow that needs both the profile and write-policy locks acquires the profile
+lock first. Reversing that order can deadlock concurrent login, policy, and
+mutation commands.
 
 ## Context
 

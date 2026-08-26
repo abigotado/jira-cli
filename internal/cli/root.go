@@ -16,6 +16,7 @@ import (
 	"github.com/abigotado/jira-cli/internal/auth"
 	"github.com/abigotado/jira-cli/internal/errx"
 	"github.com/abigotado/jira-cli/internal/jira"
+	"github.com/abigotado/jira-cli/internal/lockfile"
 	"github.com/abigotado/jira-cli/internal/output"
 	"github.com/abigotado/jira-cli/internal/profile"
 	"github.com/abigotado/jira-cli/internal/writepolicy"
@@ -51,6 +52,8 @@ type jiraMutationClient interface {
 	TransitionIssue(context.Context, string, string) error
 	AddComment(context.Context, string, string) (jira.Comment, error)
 }
+
+var _ jiraMutationClient = (*jira.Client)(nil)
 
 type writePolicyRegistry interface {
 	WithPolicyLock(context.Context, string, func() error) error
@@ -178,10 +181,13 @@ func (a *App) runMutation(ctx context.Context, projectKey, action string, fn fun
 	if a.profileName == "" {
 		return errx.ProfileRequired()
 	}
+	if err := a.out.Validate(mutationReceipt{}); err != nil {
+		return err
+	}
 	if a.registry == nil || a.policies == nil {
 		return errx.Internal("profile or write policy registry is unavailable")
 	}
-	return a.registry.WithProfileLock(ctx, a.profileName, func() error {
+	err := a.registry.WithProfileLock(ctx, a.profileName, func() error {
 		selected, err := a.registry.Get(ctx, a.profileName)
 		if err != nil {
 			return translateLocal(err, a.profileName)
@@ -197,14 +203,7 @@ func (a *App) runMutation(ctx context.Context, projectKey, action string, fn fun
 			if a.dryRun {
 				return fn(nil, selected)
 			}
-			if selected.ExpiresAt != nil && !a.now().Before(*selected.ExpiresAt) {
-				return errx.Auth("TOKEN_EXPIRED", "the API token for profile %q is expired", selected.Name)
-			}
-			credential, err := a.store.Load(ctx, selected.Name)
-			if err != nil {
-				return translateLocal(err, selected.Name)
-			}
-			reader, err := a.newJira(selected, credential, a.log)
+			reader, err := a.loadClientLocked(ctx, selected)
 			if err != nil {
 				return err
 			}
@@ -215,6 +214,7 @@ func (a *App) runMutation(ctx context.Context, projectKey, action string, fn fun
 			return fn(client, selected)
 		})
 	})
+	return translateLocalLockBoundary(err)
 }
 
 func (a *App) setup(cmd *cobra.Command, _ []string) error {
@@ -231,8 +231,8 @@ func (a *App) setup(cmd *cobra.Command, _ []string) error {
 		}
 		format = parsed
 	}
-	if format == output.FormatRaw && len(a.fields) > 0 {
-		return errx.Usage("--fields cannot be combined with --output raw")
+	if err := output.ValidateFormat(format, a.fields); err != nil {
+		return err
 	}
 	a.out = &output.Writer{Format: format, Fields: a.fields, Out: a.stdout, Err: a.stderr}
 	level := slog.LevelWarn
@@ -285,21 +285,31 @@ func (a *App) client(ctx context.Context) (jiraReader, profile.Profile, error) {
 		if loadErr != nil {
 			return translateLocal(loadErr, a.profileName)
 		}
-		if selected.ExpiresAt != nil && !a.now().Before(*selected.ExpiresAt) {
-			return errx.Auth("TOKEN_EXPIRED", "the API token for profile %q is expired", selected.Name)
-		}
-		credential, loadErr := a.store.Load(ctx, selected.Name)
-		if loadErr != nil {
-			return translateLocal(loadErr, selected.Name)
-		}
-		client, loadErr = a.newJira(selected, credential, a.log)
+		client, loadErr = a.loadClientLocked(ctx, selected)
 		return loadErr
 	})
 	if err != nil {
-		return nil, profile.Profile{}, err
+		return nil, profile.Profile{}, translateLocalLockBoundary(err)
+	}
+	return client, selected, nil
+}
+
+// loadClientLocked loads credentials and constructs a Jira client while the
+// caller holds the selected profile's lock.
+func (a *App) loadClientLocked(ctx context.Context, selected profile.Profile) (jiraReader, error) {
+	if selected.ExpiresAt != nil && !a.now().Before(*selected.ExpiresAt) {
+		return nil, errx.Auth("TOKEN_EXPIRED", "the API token for profile %q is expired", selected.Name)
+	}
+	credential, err := a.store.Load(ctx, selected.Name)
+	if err != nil {
+		return nil, translateLocal(err, selected.Name)
+	}
+	client, err := a.newJira(selected, credential, a.log)
+	if err != nil {
+		return nil, err
 	}
 	a.out.WithContext(selected.Name, selected.Site)
-	return client, selected, nil
+	return client, nil
 }
 
 func usageArgs(validator cobra.PositionalArgs) cobra.PositionalArgs {
@@ -382,6 +392,27 @@ func translateWritePolicy(err error, profileName, projectKey string) error {
 	default:
 		return errx.Internal("local write policy operation failed")
 	}
+}
+
+func isLockTimeout(err error) bool {
+	var timeout *lockfile.TimeoutError
+	return errors.As(err, &timeout)
+}
+
+// translateLocalLockBoundary is used only when a CLI-owned lock acquisition
+// failed before its protected credential or Jira operation could begin.
+func translateLocalLockBoundary(err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *errx.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	if isLockTimeout(err) {
+		return errx.LocalLockBusy().Wrap(err)
+	}
+	return err
 }
 
 // Run executes one command tree and returns its process status.

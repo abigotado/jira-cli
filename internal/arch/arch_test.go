@@ -100,3 +100,20 @@ func TestErrxImportsNothingFromThisModule(t *testing.T) {
 		}
 	}
 }
+
+// Write policy is local, non-secret authorization state. It must not acquire
+// credentials or reach Jira on its own.
+func TestWritePolicyDoesNotImportAuthOrJira(t *testing.T) {
+	if !packageExists(t, "internal/writepolicy") {
+		t.Skip("internal/writepolicy has not been added yet")
+	}
+	forbidden := map[string]bool{
+		module + "/internal/auth": true,
+		module + "/internal/jira": true,
+	}
+	for _, dependency := range dependencies(t, module+"/internal/writepolicy") {
+		if forbidden[dependency] {
+			t.Errorf("internal/writepolicy depends on %s; keep policy storage independent of credentials and Jira", dependency)
+		}
+	}
+}

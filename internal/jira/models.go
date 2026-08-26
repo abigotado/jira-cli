@@ -190,6 +190,8 @@ type ADFInline struct {
 const (
 	maxSummaryRunes = 255
 	maxBodyRunes    = 32767
+	maxLabels       = 100
+	maxLabelRunes   = 255
 )
 
 // NewPlainTextDocument validates and converts bounded plain text to ADF.
@@ -224,6 +226,7 @@ type CreateIssueRequest struct {
 	IssueTypeID string
 	Summary     string
 	Description *string
+	Labels      []string
 }
 
 // EditIssueRequest contains the bounded fields jira-cli supports editing.
@@ -240,6 +243,34 @@ func ValidateSummary(summary string) error {
 	}
 	if utf8.RuneCountInString(summary) > maxSummaryRunes {
 		return errx.Usage("--summary cannot exceed %d characters", maxSummaryRunes)
+	}
+	return nil
+}
+
+// ValidateLabels validates a bounded list of exact Jira label values without
+// normalizing their order or case.
+func ValidateLabels(labels []string) error {
+	if len(labels) > maxLabels {
+		return errx.Usage("--label cannot be repeated more than %d times", maxLabels)
+	}
+	seen := make(map[string]struct{}, len(labels))
+	for index, label := range labels {
+		if !utf8.ValidString(label) {
+			return errx.Usage("--label at position %d must be valid UTF-8", index+1)
+		}
+		count := utf8.RuneCountInString(label)
+		if count == 0 || count > maxLabelRunes {
+			return errx.Usage("--label at position %d must contain 1-%d characters", index+1, maxLabelRunes)
+		}
+		for _, character := range label {
+			if unicode.IsSpace(character) || unicode.IsControl(character) || unicode.Is(unicode.Zl, character) || unicode.Is(unicode.Zp, character) {
+				return errx.Usage("--label at position %d must not contain whitespace or control characters", index+1)
+			}
+		}
+		if _, exists := seen[label]; exists {
+			return errx.Usage("--label values must be unique")
+		}
+		seen[label] = struct{}{}
 	}
 	return nil
 }

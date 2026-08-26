@@ -29,7 +29,7 @@ const (
 	CodeAmbiguous Code = 4
 	// CodeAuth signals missing, expired, or rejected credentials.
 	CodeAuth Code = 5
-	// CodeRetryable signals a transient failure.
+	// CodeRetryable signals a transient failure known to be safe to retry.
 	CodeRetryable Code = 6
 	// CodeConfirm signals that a write requires explicit approval.
 	CodeConfirm Code = 7
@@ -54,7 +54,7 @@ var codes = []CodeInfo{
 	{CodeNotFound, "NOT_FOUND", "object not found or not visible", "check the key and profile"},
 	{CodeAmbiguous, "AMBIGUOUS", "several objects matched", "pick from candidates"},
 	{CodeAuth, "AUTH", "missing, expired, or rejected credentials", "log in or rotate the API token"},
-	{CodeRetryable, "RETRYABLE", "rate limit or transient network failure", "back off and retry safely"},
+	{CodeRetryable, "RETRYABLE", "transient rate-limit, read-transport, timeout, or local-lock failure", "follow the hint, then retry safely"},
 	{CodeConfirm, "CONFIRMATION_REQUIRED", "write was not confirmed", "obtain approval, then add --yes"},
 	{CodePermission, "PERMISSION_DENIED", "Jira permission or token scope denied", "request permission or scope; do not retry unchanged"},
 	{CodeConflict, "CONFLICT", "stale state or write conflict", "re-read the issue or transition before deciding"},

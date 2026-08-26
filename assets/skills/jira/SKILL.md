@@ -83,24 +83,27 @@ Supported forms are:
 
 ```text
 jira-cli issues types --project WL --profile work --limit 50
-jira-cli issues create --project WL --issue-type-id 10001 --summary TEXT [--description TEXT] --profile work --dry-run
+jira-cli issues create --project WL --issue-type-id 10001 --summary TEXT [--description TEXT] [--label LABEL]... --profile work --dry-run
 jira-cli issues edit WL-123 [--summary TEXT] [--description TEXT | --clear-description] --profile work --dry-run
 jira-cli issues transition WL-123 --transition-id 31 --profile work --dry-run
 jira-cli comments add --issue WL-123 --body TEXT --profile work --dry-run
 ```
 
-Keep summaries, descriptions, and comments out of `--fields`: mutation
-receipts intentionally never echo their contents. Never add `--yes` merely to
-silence exit 7; it represents the user's approval after reviewing dry-run.
+Keep summaries, descriptions, labels, and comments out of `--fields`:
+mutation receipts intentionally never echo their contents. `--label` is an
+exact repeatable flag: use it at most 100 times, preserve the intended order
+and case, and do not supply whitespace, control characters, duplicates, or
+values longer than 255 characters. Never add `--yes` merely to silence exit 7;
+it represents the user's approval after reviewing dry-run.
 
 An actual write performs remote identity preflights and uses bounded numeric
 IDs, then verifies the issue project again after success. Issue creation also
 fully checks Jira's create-screen field metadata before POST. On
 `CREATE_FIELDS_UNSUPPORTED`, follow the hint: provide the supported description
-when requested, choose or configure a standard issue type whose other required
-fields have Jira defaults, or create the issue in Jira. Never bypass the
-bounded command with raw fields, direct REST, another CLI, or browser
-automation.
+or labels when requested, choose or configure a standard issue type whose
+other required fields have Jira defaults, or create the issue in Jira. Never
+bypass the bounded command with raw fields, direct REST, another CLI, or
+browser automation.
 
 The local allowlist is a target-selection rail; Jira account permissions are
 the hard authorization boundary. A write is attempted once. On exit 9 with
@@ -113,6 +116,9 @@ uncertainty to the user. For any other nonzero exit, follow the envelope's
 
 Exit 0 means the envelope is usable. For every other exit, read `error.code`
 and `hint`; do not guess from prose or repeat the same command unchanged.
+`LOCAL_LOCK_BUSY` means the contended operation did not run and credential
+access has not begun; wait for the other jira-cli process to finish, then
+retry.
 Read [reference/contract.md](reference/contract.md) when an exit needs handling.
 Read [reference/commands.md](reference/commands.md) when selecting flags or
 pagination behavior.

@@ -188,10 +188,12 @@ does not read Keychain or contact Jira:
 jira-cli issues types --project WL --profile work --limit 50
 jira-cli issues create --profile work --project WL \
   --issue-type-id 10001 --summary 'Bounded summary' \
-  --description 'Plain-text description' --dry-run
+  --description 'Plain-text description' \
+  --label backend --label urgent --dry-run
 jira-cli issues create --profile work --project WL \
   --issue-type-id 10001 --summary 'Bounded summary' \
-  --description 'Plain-text description' --yes
+  --description 'Plain-text description' \
+  --label backend --label urgent --yes
 
 jira-cli issues edit WL-123 --profile work \
   --summary 'Replacement summary' --dry-run
@@ -214,21 +216,29 @@ jira-cli comments add --issue WL-123 --profile work \
 supported because this bounded CLI intentionally has no parent-issue write
 contract.
 
+Issue creation accepts `--label` up to 100 times. Each exact label is 1-255
+Unicode characters without whitespace, control characters, or duplicates;
+order and case are preserved. Labels are sent only through Jira's typed
+`labels` field and are never echoed in mutation receipts or errors.
+
 Before an actual mutation, `jira-cli` checks the identity-bound allowlist and
 re-reads exact canonical project, issue, issue-type, and transition identities
 as applicable. Issue creation also fully reads Jira's create-screen metadata
-before the POST. If the selected project and type require a field that the
-bounded CLI cannot supply and Jira has no default for it, creation fails closed
-with `CREATE_FIELDS_UNSUPPORTED`; choose another standard type, change the Jira
-screen configuration, or create the issue in Jira. Do not work around this with
-raw fields or direct REST calls.
+before the POST. Required description and labels fields can be supplied with
+`--description` and repeatable `--label`; other required fields must have Jira
+defaults. If the selected project and type still require a field that the
+bounded CLI cannot supply, creation fails closed with
+`CREATE_FIELDS_UNSUPPORTED`; follow its bounded hint, choose another standard
+type, change the Jira screen configuration, or create the issue in Jira. Do not
+work around this with raw fields or direct REST calls.
 
 `--dry-run` remains deliberately local and reports
 `remote_checks:"not_performed"`, so it cannot prove that current Jira screen
 metadata accepts the payload. Actual writes use numeric Jira IDs, are attempted
-once, and never echo summary, description, or comment bodies in receipts. Exit
-9 with `WRITE_OUTCOME_UNKNOWN` means the request may have succeeded; re-read
-Jira to reconcile it and do not repeat the write automatically.
+once, and never echo summary, description, labels, or comment bodies in
+receipts. Exit 9 with `WRITE_OUTCOME_UNKNOWN` means the request may have
+succeeded; re-read Jira to reconcile it and do not repeat the write
+automatically.
 
 ## Agent Skill
 
@@ -273,6 +283,10 @@ for the complete versioned table.
 Exit codes communicate the caller's next action: internal `1`, usage `2`, not
 found `3`, ambiguous `4`, authentication `5`, retryable `6`, confirmation `7`,
 permission/scope `8`, and conflict/stale state `9`.
+
+`LOCAL_LOCK_BUSY` uses retryable exit 6. The contended operation did not run
+and credential access has not begun; wait for the other jira-cli process to
+finish, then retry.
 
 ## Security
 

@@ -156,7 +156,7 @@ func Inexact(kind, query string, candidates []Candidate) *Error {
 // bounded jira-cli payload. Only canonical field IDs are exposed, with a
 // strict count and length bound; Jira field names and raw metadata never
 // become part of the public error.
-func CreateFieldsUnsupported(fieldIDs []string, provideDescription bool) *Error {
+func CreateFieldsUnsupported(fieldIDs []string, provideDescription bool, labelHint ...bool) *Error {
 	const (
 		maxReportedIDs  = 8
 		maxFieldIDBytes = 255
@@ -189,9 +189,15 @@ func CreateFieldsUnsupported(fieldIDs []string, provideDescription bool) *Error 
 	if omitted > 0 {
 		message += fmt.Sprintf(" (%d field IDs omitted)", omitted)
 	}
+	provideLabels := len(labelHint) > 0 && labelHint[0]
 	hint := "choose or configure a standard issue type so unsupported fields are optional or have Jira defaults"
-	if provideDescription && len(ordered) == 1 && ordered[0] == "description" {
+	switch {
+	case provideDescription && provideLabels && len(ordered) == 2 && ordered[0] == "description" && ordered[1] == "labels":
+		hint = "re-run with --description and at least one --label to supply the required description and labels fields"
+	case provideDescription && len(ordered) == 1 && ordered[0] == "description":
 		hint = "re-run with --description to supply the required description field"
+	case provideLabels && len(ordered) == 1 && ordered[0] == "labels":
+		hint = "re-run with at least one --label to supply the required labels field"
 	}
 	return &Error{
 		Code:    CodeUsage,
@@ -201,12 +207,19 @@ func CreateFieldsUnsupported(fieldIDs []string, provideDescription bool) *Error 
 	}
 }
 
+// LocalLockBusy reports bounded contention on local profile or policy state.
+// The contended operation did not run when this error is returned.
+func LocalLockBusy() *Error {
+	return Retryable("LOCAL_LOCK_BUSY", 0, "another jira-cli process is using the selected local profile state").
+		WithHint("wait for the other jira-cli process to finish, then retry")
+}
+
 // Auth reports missing, rejected, or expired Jira credentials.
 func Auth(reason, format string, args ...any) *Error {
 	return &Error{Code: CodeAuth, Reason: reason, Message: fmt.Sprintf(format, args...), Hint: "run 'jira-cli auth login --profile NAME' or rotate the API token"}
 }
 
-// Retryable reports a rate limit or transient transport failure.
+// Retryable reports a transient failure known to be safe to retry.
 func Retryable(reason string, retryAfter time.Duration, format string, args ...any) *Error {
 	hint := "back off and retry if the operation is safe to repeat"
 	if retryAfter > 0 {

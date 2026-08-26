@@ -36,6 +36,14 @@ func ParseFormat(value string) (Format, error) {
 	}
 }
 
+// ValidateFormat checks cross-flag output constraints without rendering.
+func ValidateFormat(format Format, fields []string) error {
+	if format == FormatRaw && len(fields) > 0 {
+		return errx.Usage("--fields cannot be combined with --output raw")
+	}
+	return nil
+}
+
 // Field is one output-safe name/value pair for an entity.
 type Field struct {
 	// Name is the stable projection key.
@@ -126,6 +134,30 @@ func (w *Writer) WithContext(profile, site string) *Writer {
 	return w
 }
 
+// Validate checks the requested projection against a value's live output
+// vocabulary. Mutation commands call this before dispatching side effects.
+func (w *Writer) Validate(data any) error {
+	if err := ValidateFormat(w.Format, w.Fields); err != nil {
+		return err
+	}
+	if len(w.Fields) == 0 {
+		return nil
+	}
+	rows, _, ok := asRows(data)
+	if !ok {
+		return errx.Usage("--fields is not supported for this command")
+	}
+	if len(rows) > 0 {
+		_, err := selectFields(rows[0].Fields(), w.Fields)
+		return err
+	}
+	if schema := collectionSchema(data); schema != nil {
+		_, err := selectFields(schema.Fields(), w.Fields)
+		return err
+	}
+	return nil
+}
+
 // DefaultFormat returns JSON unless stdout is a terminal.
 func DefaultFormat(stdout *os.File) Format {
 	info, err := stdout.Stat()
@@ -147,13 +179,13 @@ func (w *Writer) SuccessPage(data any, truncated bool, nextCursor string) error 
 }
 
 func (w *Writer) success(data any, truncated bool, nextCursor string, paged bool) error {
+	if err := w.Validate(data); err != nil {
+		return err
+	}
 	switch w.Format {
 	case FormatText:
 		return w.renderText(data)
 	case FormatRaw:
-		if len(w.Fields) > 0 {
-			return errx.Usage("--fields cannot be combined with --output raw")
-		}
 		return w.encode(data)
 	case FormatJSON:
 		payload, err := w.project(data)

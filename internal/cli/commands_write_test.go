@@ -8,10 +8,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/abigotado/jira-cli/internal/auth"
 	"github.com/abigotado/jira-cli/internal/errx"
 	"github.com/abigotado/jira-cli/internal/jira"
+	"github.com/abigotado/jira-cli/internal/lockfile"
 	"github.com/abigotado/jira-cli/internal/output"
 	"github.com/abigotado/jira-cli/internal/profile"
 	"github.com/abigotado/jira-cli/internal/writepolicy"
@@ -80,13 +82,82 @@ func TestAuthAllowProjectsCommandsStayLocalAndCanonical(t *testing.T) {
 }
 
 func TestCommittedWritePolicyErrorRequiresReconciliation(t *testing.T) {
-	err := translateWritePolicy(&writepolicy.CommitError{Err: errors.New("directory sync failed")}, "work", "")
-	var typed *errx.Error
-	if !errors.As(err, &typed) || typed.Code != errx.CodeConflict || typed.Reason != "WRITE_POLICY_OUTCOME_UNKNOWN" {
-		t.Fatalf("error = %#v, want WRITE_POLICY_OUTCOME_UNKNOWN", typed)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "durability error", err: errors.New("directory sync failed")},
+		{name: "timeout-shaped durability error", err: &lockfile.TimeoutError{Path: "/private/sentinel", Timeout: time.Second}},
 	}
-	if !strings.Contains(typed.Hint, "auth allow-projects show --profile work") {
-		t.Fatalf("hint = %q, want reconciliation command", typed.Hint)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := translateWritePolicyLockBoundary(&writepolicy.CommitError{Err: test.err}, "work")
+			var typed *errx.Error
+			if !errors.As(err, &typed) || typed.Code != errx.CodeConflict || typed.Reason != "WRITE_POLICY_OUTCOME_UNKNOWN" {
+				t.Fatalf("error = %#v, want WRITE_POLICY_OUTCOME_UNKNOWN", typed)
+			}
+			if !strings.Contains(typed.Hint, "auth allow-projects show --profile work") {
+				t.Fatalf("hint = %q, want reconciliation command", typed.Hint)
+			}
+			if strings.Contains(typed.Message+typed.Hint, "/private/sentinel") {
+				t.Fatal("lock path leaked")
+			}
+		})
+	}
+}
+
+func TestLocalPolicyMutationsValidateOutputBeforeChangingState(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "unknown projected field", args: []string{"--profile", "work", "--yes", "--fields", "authorization", "auth", "allow-projects", "set", "--project", "WL"}},
+		{name: "raw output with fields", args: []string{"--profile", "work", "--yes", "--output", "raw", "--fields", "projects", "auth", "allow-projects", "clear"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}
+			app, stdout, stderr := testApp(store, &fakeJira{})
+			policies := app.policies.(*fakePolicyRegistry)
+			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json"}, test.args...))
+			if code != errx.CodeUsage {
+				t.Fatalf("code = %d, want %d stdout=%s stderr=%s", code, errx.CodeUsage, stdout.String(), stderr.String())
+			}
+			if policies.gets != 0 || policies.sets != 0 || policies.clears != 0 || policies.requires != 0 {
+				t.Fatalf("invalid output mutated or read policy: %#v", policies)
+			}
+			if store.loads != 0 || store.saves != 0 || store.deletes != 0 {
+				t.Fatalf("invalid output touched credentials: %#v", store)
+			}
+		})
+	}
+}
+
+func TestProfileRequiredPrecedesProjectionValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "remote mutation", args: []string{"--yes", "--fields", "authorization", "comments", "add", "--issue", "WL-1", "--body", "safe"}},
+		{name: "policy show", args: []string{"--fields", "authorization", "auth", "allow-projects", "show"}},
+		{name: "policy set", args: []string{"--yes", "--fields", "authorization", "auth", "allow-projects", "set", "--project", "WL"}},
+		{name: "policy clear", args: []string{"--yes", "--fields", "authorization", "auth", "allow-projects", "clear"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}
+			client := &fakeJira{}
+			app, stdout, _ := testApp(store, client)
+			policies := app.policies.(*fakePolicyRegistry)
+			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json"}, test.args...))
+			if code != errx.CodeUsage {
+				t.Fatalf("code = %d, want usage stdout=%s", code, stdout.String())
+			}
+			assertErrorReason(t, stdout.Bytes(), "PROFILE_REQUIRED")
+			if store.loads != 0 || client.totalCalls() != 0 || policies.gets != 0 || policies.sets != 0 || policies.clears != 0 || policies.requires != 0 {
+				t.Fatalf("profile precedence crossed a boundary: store=%#v client=%#v policies=%#v", store, client, policies)
+			}
+		})
 	}
 }
 
@@ -98,14 +169,16 @@ func TestMutationValidationAndSafetyRailsRunBeforeCredentialOrJira(t *testing.T)
 		wantCode   errx.Code
 		wantReason string
 		wantHint   string
+		noPolicy   bool
 	}{
 		{name: "missing yes", args: []string{"--profile", "work", "issues", "create", "--project", "WL", "--issue-type-id", "1", "--summary", "safe"}, wantCode: errx.CodeConfirm, wantReason: "CONFIRMATION_REQUIRED"},
 		{name: "missing profile", args: []string{"--yes", "issues", "create", "--project", "WL", "--issue-type-id", "1", "--summary", "safe"}, wantCode: errx.CodeUsage, wantReason: "PROFILE_REQUIRED"},
 		{name: "lowercase project is rejected", args: []string{"--profile", "work", "--yes", "issues", "create", "--project", "wl", "--issue-type-id", "1", "--summary", "safe"}, wantCode: errx.CodeUsage, wantReason: "USAGE"},
 		{name: "moved or case-changed issue key is rejected locally", args: []string{"--profile", "work", "--yes", "issues", "edit", "wl-1", "--summary", "safe"}, wantCode: errx.CodeUsage, wantReason: "USAGE"},
 		{name: "nonnumeric issue type is rejected", args: []string{"--profile", "work", "--yes", "issues", "create", "--project", "WL", "--issue-type-id", "Task", "--summary", "safe"}, wantCode: errx.CodeUsage, wantReason: "USAGE"},
-		{name: "invalid output field is rejected", args: []string{"--profile", "work", "--yes", "--fields", "authorization", "comments", "add", "--issue", "WL-1", "--body", "safe"}, wantCode: errx.CodeUsage, wantReason: "USAGE"},
-		{name: "raw output with fields is rejected", args: []string{"--profile", "work", "--yes", "--output", "raw", "--fields", "issue_id", "comments", "add", "--issue", "WL-1", "--body", "safe"}, wantCode: errx.CodeUsage, wantReason: "USAGE"},
+		{name: "invalid label is rejected", args: []string{"--profile", "work", "--yes", "issues", "create", "--project", "WL", "--issue-type-id", "1", "--summary", "safe", "--label", "two words"}, wantCode: errx.CodeUsage, wantReason: "USAGE", noPolicy: true},
+		{name: "invalid output field is rejected", args: []string{"--profile", "work", "--yes", "--fields", "authorization", "comments", "add", "--issue", "WL-1", "--body", "safe"}, wantCode: errx.CodeUsage, wantReason: "USAGE", noPolicy: true},
+		{name: "raw output with fields is rejected", args: []string{"--profile", "work", "--yes", "--output", "raw", "--fields", "issue_id", "comments", "add", "--issue", "WL-1", "--body", "safe"}, wantCode: errx.CodeUsage, wantReason: "USAGE", noPolicy: true},
 		{name: "missing write policy", args: []string{"--profile", "work", "--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"}, policyErr: writepolicy.ErrNotFound, wantCode: errx.CodePermission, wantReason: "WRITE_POLICY_MISSING"},
 		{name: "missing write policy is checked before confirmation", args: []string{"--profile", "work", "comments", "add", "--issue", "WL-1", "--body", "safe"}, policyErr: writepolicy.ErrNotFound, wantCode: errx.CodePermission, wantReason: "WRITE_POLICY_MISSING"},
 		{name: "stale write policy", args: []string{"--profile", "work", "--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"}, policyErr: writepolicy.ErrStale, wantCode: errx.CodePermission, wantReason: "WRITE_POLICY_STALE"},
@@ -116,7 +189,8 @@ func TestMutationValidationAndSafetyRailsRunBeforeCredentialOrJira(t *testing.T)
 			store := &fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}
 			client := &fakeJira{}
 			app, stdout, stderr := testApp(store, client)
-			app.policies.(*fakePolicyRegistry).requireErr = test.policyErr
+			policies := app.policies.(*fakePolicyRegistry)
+			policies.requireErr = test.policyErr
 			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json"}, test.args...))
 			if code != test.wantCode {
 				t.Fatalf("code = %d, want %d stdout=%s stderr=%s", code, test.wantCode, stdout.String(), stderr.String())
@@ -127,6 +201,9 @@ func TestMutationValidationAndSafetyRailsRunBeforeCredentialOrJira(t *testing.T)
 			}
 			if store.loads != 0 || client.totalMutationCalls() != 0 || client.projectCalls != 0 || client.issueCalls != 0 {
 				t.Fatalf("unsafe prevalidation effects: loads=%d client=%#v", store.loads, client)
+			}
+			if test.noPolicy && policies.requires != 0 {
+				t.Fatalf("invalid local input reached write policy: requires=%d", policies.requires)
 			}
 			if strings.Contains(stdout.String()+stderr.String(), store.credential.Token) {
 				t.Fatal("credential leaked")
@@ -140,7 +217,7 @@ func TestMutationDryRunIsLocalOnly(t *testing.T) {
 		name string
 		args []string
 	}{
-		{name: "create", args: []string{"issues", "create", "--project", "WL", "--issue-type-id", "1", "--summary", "safe"}},
+		{name: "create", args: []string{"issues", "create", "--project", "WL", "--issue-type-id", "1", "--summary", "safe", "--label", "DRY_RUN_LABEL_SENTINEL", "--label", "Second"}},
 		{name: "edit", args: []string{"issues", "edit", "WL-1", "--clear-description"}},
 		{name: "transition", args: []string{"issues", "transition", "WL-1", "--transition-id", "31"}},
 		{name: "comment", args: []string{"comments", "add", "--issue", "WL-1", "--body", "safe"}},
@@ -164,6 +241,9 @@ func TestMutationDryRunIsLocalOnly(t *testing.T) {
 			data := envelope.Data.(map[string]any)
 			if data["dry_run"] != true || data["applied"] != false || data["remote_checks"] != "not_performed" {
 				t.Fatalf("receipt = %#v", data)
+			}
+			if strings.Contains(stdout.String(), "DRY_RUN_LABEL_SENTINEL") {
+				t.Fatalf("dry-run receipt leaked label values: %s", stdout.String())
 			}
 		})
 	}
@@ -212,13 +292,13 @@ func TestMutationCommandsPerformExactPreflightAndWriteOnce(t *testing.T) {
 		check  func(*testing.T, *fakeJira, map[string]any)
 	}{
 		{
-			name: "create", args: []string{"issues", "create", "--project", "WL", "--issue-type-id", "456", "--summary", "New issue", "--description", description},
+			name: "create", args: []string{"issues", "create", "--project", "WL", "--issue-type-id", "456", "--summary", "New issue", "--description", description, "--label", "Zulu", "--label", "alpha", "--label", "Música"},
 			client: &fakeJira{project: jira.Project{ID: "123", Key: "WL"}, issue: jira.Issue{ID: "10001", Key: "WL-1"}, created: jira.Issue{ID: "10001", Key: "WL-1", Self: "https://safe.invalid/10001"}},
 			check: func(t *testing.T, client *fakeJira, receipt map[string]any) {
 				if client.projectCalls != 1 || client.typeCalls != 0 || client.createCalls != 1 || client.issueCalls != 1 {
 					t.Fatalf("create preflight/calls = %#v", client)
 				}
-				want := jira.CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description}
+				want := jira.CreateIssueRequest{ProjectID: "123", IssueTypeID: "456", Summary: "New issue", Description: &description, Labels: []string{"Zulu", "alpha", "Música"}}
 				if !reflect.DeepEqual(client.createInput, want) {
 					t.Fatalf("create input = %#v", client.createInput)
 				}
@@ -279,6 +359,9 @@ func TestMutationCommandsPerformExactPreflightAndWriteOnce(t *testing.T) {
 			receipt := envelope.Data.(map[string]any)
 			if receipt["applied"] != true || receipt["dry_run"] != false || receipt["remote_checks"] != "verified" || receipt["project"] != "WL" {
 				t.Fatalf("receipt = %#v", receipt)
+			}
+			if envelope.Meta == nil || envelope.Meta.Profile != "work" || envelope.Meta.Site != "https://example.atlassian.net" {
+				t.Fatalf("mutation context = %#v", envelope.Meta)
 			}
 			test.check(t, test.client, receipt)
 			if strings.Contains(stdout.String()+stderr.String(), store.credential.Token) {
@@ -389,12 +472,19 @@ type fakePolicyRegistry struct {
 	mu         sync.Mutex
 	policy     writepolicy.Policy
 	requireErr error
+	lockErr    error
+	setErr     error
+	clearErr   error
 	gets       int
 	sets       int
 	clears     int
+	requires   int
 }
 
 func (r *fakePolicyRegistry) WithPolicyLock(_ context.Context, _ string, fn func() error) error {
+	if r.lockErr != nil {
+		return r.lockErr
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return fn()
@@ -416,6 +506,7 @@ func (r *fakePolicyRegistry) GetBound(_ context.Context, value profile.Profile) 
 }
 
 func (r *fakePolicyRegistry) RequireProject(_ context.Context, value profile.Profile, project string) (writepolicy.Policy, error) {
+	r.requires++
 	if r.requireErr != nil {
 		return writepolicy.Policy{}, r.requireErr
 	}
@@ -432,6 +523,9 @@ func (r *fakePolicyRegistry) RequireProject(_ context.Context, value profile.Pro
 
 func (r *fakePolicyRegistry) Set(_ context.Context, value profile.Profile, projects []string) (writepolicy.Policy, error) {
 	r.sets++
+	if r.setErr != nil {
+		return writepolicy.Policy{}, r.setErr
+	}
 	canonical, err := writepolicy.CanonicalProjects(projects)
 	if err != nil {
 		return writepolicy.Policy{}, err
@@ -442,6 +536,9 @@ func (r *fakePolicyRegistry) Set(_ context.Context, value profile.Profile, proje
 
 func (r *fakePolicyRegistry) Clear(context.Context, string) error {
 	r.clears++
+	if r.clearErr != nil {
+		return r.clearErr
+	}
 	r.policy = writepolicy.Policy{}
 	return nil
 }

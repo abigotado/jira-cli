@@ -103,6 +103,7 @@ Create one bounded issue in an allowed project
 | --- | --- | --- | --- |
 | `--description` | string |  | bounded plain-text description |
 | `--issue-type-id` | string |  | exact numeric issue type ID |
+| `--label` | stringArray |  | bounded Jira label (repeatable, maximum 100) |
 | `--project` | string |  | exact uppercase Jira project key |
 | `--summary` | string |  | bounded one-line issue summary |
 
