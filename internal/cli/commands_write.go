@@ -45,6 +45,8 @@ func (a *App) newAuthAllowProjectsShowCommand() *cobra.Command {
 			if a.registry == nil || a.policies == nil {
 				return errx.Internal("profile or write policy registry is unavailable")
 			}
+			var result writePolicyView
+			callbackCompleted := false
 			err := a.registry.WithProfileLock(cmd.Context(), a.profileName, func() error {
 				selected, err := a.registry.Get(cmd.Context(), a.profileName)
 				if err != nil {
@@ -59,10 +61,21 @@ func (a *App) newAuthAllowProjectsShowCommand() *cobra.Command {
 					if policy.Identity != writepolicy.IdentityFor(selected) {
 						state = "stale"
 					}
-					return a.out.Success(newWritePolicyView(policy, state, false, false))
+					result = newWritePolicyView(policy, state, false, false)
+					callbackCompleted = true
+					return nil
 				})
 			})
-			return translateLocalLockBoundary(err)
+			if err != nil {
+				if callbackCompleted {
+					return protectedWorkFailure(err)
+				}
+				return translateLocalLockBoundary(err)
+			}
+			if err := a.out.Success(result); err != nil {
+				return protectedWorkFailure(err)
+			}
+			return nil
 		},
 	}
 }
@@ -90,6 +103,9 @@ func (a *App) newAuthAllowProjectsSetCommand() *cobra.Command {
 			if a.registry == nil || a.policies == nil {
 				return errx.Internal("profile or write policy registry is unavailable")
 			}
+			var result writePolicyView
+			callbackCompleted := false
+			policyMutated := false
 			err = a.registry.WithProfileLock(cmd.Context(), a.profileName, func() error {
 				selected, err := a.registry.Get(cmd.Context(), a.profileName)
 				if err != nil {
@@ -102,11 +118,29 @@ func (a *App) newAuthAllowProjectsSetCommand() *cobra.Command {
 						if err != nil {
 							return translateWritePolicyLockBoundary(err, selected.Name)
 						}
+						policyMutated = true
 					}
-					return a.out.Success(newWritePolicyView(policy, "bound", a.dryRun, !a.dryRun))
+					result = newWritePolicyView(policy, "bound", a.dryRun, !a.dryRun)
+					callbackCompleted = true
+					return nil
 				})
 			})
-			return translateLocalLockBoundary(err)
+			if err != nil {
+				if policyMutated {
+					return writePolicyOutcomeUnknown(a.profileName).Wrap(err)
+				}
+				if callbackCompleted {
+					return protectedWorkFailure(err)
+				}
+				return translateLocalLockBoundary(err)
+			}
+			if err := a.out.Success(result); err != nil {
+				if policyMutated {
+					return writePolicyOutcomeUnknown(a.profileName).Wrap(err)
+				}
+				return protectedWorkFailure(err)
+			}
+			return nil
 		},
 	}
 	command.Flags().StringArrayVar(&projects, "project", nil, "exact Jira project key to allow (repeatable)")
@@ -131,6 +165,9 @@ func (a *App) newAuthAllowProjectsClearCommand() *cobra.Command {
 			if a.registry == nil || a.policies == nil {
 				return errx.Internal("profile or write policy registry is unavailable")
 			}
+			var result writePolicyView
+			callbackCompleted := false
+			policyMutated := false
 			err := a.registry.WithProfileLock(cmd.Context(), a.profileName, func() error {
 				selected, err := a.registry.Get(cmd.Context(), a.profileName)
 				if err != nil {
@@ -141,12 +178,30 @@ func (a *App) newAuthAllowProjectsClearCommand() *cobra.Command {
 						if err := a.policies.Clear(cmd.Context(), selected.Name); err != nil {
 							return translateWritePolicyLockBoundary(err, selected.Name)
 						}
+						policyMutated = true
 					}
 					policy := writepolicy.Policy{Profile: selected.Name, Identity: writepolicy.IdentityFor(selected), Projects: []string{}}
-					return a.out.Success(newWritePolicyView(policy, "cleared", a.dryRun, !a.dryRun))
+					result = newWritePolicyView(policy, "cleared", a.dryRun, !a.dryRun)
+					callbackCompleted = true
+					return nil
 				})
 			})
-			return translateLocalLockBoundary(err)
+			if err != nil {
+				if policyMutated {
+					return writePolicyOutcomeUnknown(a.profileName).Wrap(err)
+				}
+				if callbackCompleted {
+					return protectedWorkFailure(err)
+				}
+				return translateLocalLockBoundary(err)
+			}
+			if err := a.out.Success(result); err != nil {
+				if policyMutated {
+					return writePolicyOutcomeUnknown(a.profileName).Wrap(err)
+				}
+				return protectedWorkFailure(err)
+			}
+			return nil
 		},
 	}
 }
@@ -232,30 +287,30 @@ func (a *App) newIssuesCreateCommand() *cobra.Command {
 			if cmd.Flags().Changed("description") {
 				input.Description = &description
 			}
-			return a.runMutation(cmd.Context(), projectKey, "issues.create", func(client jiraMutationClient, _ profile.Profile) error {
+			return a.runMutation(cmd.Context(), projectKey, "issues.create", func(client jiraMutationClient, _ profile.Profile) (mutationReceipt, error) {
 				receipt := mutationReceipt{Action: "issues.create", DryRun: a.dryRun, Applied: !a.dryRun, RemoteChecks: remoteCheckState(a.dryRun), Project: projectKey, IssueTypeID: issueTypeID}
 				if a.dryRun {
-					return a.out.Success(receipt)
+					return receipt, nil
 				}
 				project, err := exactProject(cmd.Context(), client, projectKey)
 				if err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				input.ProjectID = project.ID
 				created, err := client.CreateIssue(cmd.Context(), input)
 				if err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				createdProject, keyErr := projectFromIssueKey(created.Key)
 				if keyErr != nil || createdProject != projectKey || requireNumericFlag(created.ID, "Jira issue ID") != nil {
-					return errx.WriteOutcomeUnknown("issues.create")
+					return mutationReceipt{}, errx.WriteOutcomeUnknown("issues.create")
 				}
 				verified, err := verifyIssueProject(cmd.Context(), client, created.ID, projectKey, "issues.create")
 				if err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				receipt.IssueKey, receipt.IssueID, receipt.Self = verified.Key, verified.ID, created.Self
-				return a.out.Success(receipt)
+				return receipt, nil
 			})
 		},
 	}
@@ -304,14 +359,14 @@ func (a *App) newIssuesEditCommand() *cobra.Command {
 			if descriptionChanged || clearDescription {
 				changed = append(changed, "description")
 			}
-			return a.runMutation(cmd.Context(), projectKey, "issues.edit", func(client jiraMutationClient, _ profile.Profile) error {
+			return a.runMutation(cmd.Context(), projectKey, "issues.edit", func(client jiraMutationClient, _ profile.Profile) (mutationReceipt, error) {
 				receipt := mutationReceipt{Action: "issues.edit", DryRun: a.dryRun, Applied: !a.dryRun, RemoteChecks: remoteCheckState(a.dryRun), Project: projectKey, IssueKey: args[0], ChangedFields: changed}
 				if a.dryRun {
-					return a.out.Success(receipt)
+					return receipt, nil
 				}
 				issue, err := exactIssue(cmd.Context(), client, args[0])
 				if err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				input := jira.EditIssueRequest{ClearDescription: clearDescription}
 				if summaryChanged {
@@ -321,13 +376,13 @@ func (a *App) newIssuesEditCommand() *cobra.Command {
 					input.Description = &description
 				}
 				if err := client.EditIssue(cmd.Context(), issue.ID, input); err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				if _, err := verifyIssueProject(cmd.Context(), client, issue.ID, projectKey, "issues.edit"); err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				receipt.IssueID = issue.ID
-				return a.out.Success(receipt)
+				return receipt, nil
 			})
 		},
 	}
@@ -352,18 +407,18 @@ func (a *App) newIssuesTransitionCommand() *cobra.Command {
 			if err := requireNumericFlag(transitionID, "--transition-id"); err != nil {
 				return err
 			}
-			return a.runMutation(cmd.Context(), projectKey, "issues.transition", func(client jiraMutationClient, _ profile.Profile) error {
+			return a.runMutation(cmd.Context(), projectKey, "issues.transition", func(client jiraMutationClient, _ profile.Profile) (mutationReceipt, error) {
 				receipt := mutationReceipt{Action: "issues.transition", DryRun: a.dryRun, Applied: !a.dryRun, RemoteChecks: remoteCheckState(a.dryRun), Project: projectKey, IssueKey: args[0], TransitionID: transitionID}
 				if a.dryRun {
-					return a.out.Success(receipt)
+					return receipt, nil
 				}
 				issue, err := exactIssue(cmd.Context(), client, args[0])
 				if err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				transitions, err := client.Transitions(cmd.Context(), issue.ID)
 				if err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				found := false
 				for _, transition := range transitions {
@@ -373,17 +428,17 @@ func (a *App) newIssuesTransitionCommand() *cobra.Command {
 					}
 				}
 				if !found {
-					return errx.NotFound("transition", transitionID, nil).
+					return mutationReceipt{}, errx.NotFound("transition", transitionID, nil).
 						WithHint("re-run 'jira-cli issues transitions %s --profile NAME' and choose an exact numeric transition ID", args[0])
 				}
 				if err := client.TransitionIssue(cmd.Context(), issue.ID, transitionID); err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				if _, err := verifyIssueProject(cmd.Context(), client, issue.ID, projectKey, "issues.transition"); err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				receipt.IssueID = issue.ID
-				return a.out.Success(receipt)
+				return receipt, nil
 			})
 		},
 	}
@@ -408,27 +463,27 @@ func (a *App) newCommentsAddCommand() *cobra.Command {
 			if _, err := jira.NewPlainTextDocument(body, "body"); err != nil {
 				return err
 			}
-			return a.runMutation(cmd.Context(), projectKey, "comments.add", func(client jiraMutationClient, _ profile.Profile) error {
+			return a.runMutation(cmd.Context(), projectKey, "comments.add", func(client jiraMutationClient, _ profile.Profile) (mutationReceipt, error) {
 				receipt := mutationReceipt{Action: "comments.add", DryRun: a.dryRun, Applied: !a.dryRun, RemoteChecks: remoteCheckState(a.dryRun), Project: projectKey, IssueKey: issueKey}
 				if a.dryRun {
-					return a.out.Success(receipt)
+					return receipt, nil
 				}
 				issue, err := exactIssue(cmd.Context(), client, issueKey)
 				if err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				comment, err := client.AddComment(cmd.Context(), issue.ID, body)
 				if err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				if requireNumericFlag(comment.ID, "Jira comment ID") != nil {
-					return errx.WriteOutcomeUnknown("comments.add")
+					return mutationReceipt{}, errx.WriteOutcomeUnknown("comments.add")
 				}
 				if _, err := verifyIssueProject(cmd.Context(), client, issue.ID, projectKey, "comments.add"); err != nil {
-					return err
+					return mutationReceipt{}, err
 				}
 				receipt.IssueID, receipt.CommentID = issue.ID, comment.ID
-				return a.out.Success(receipt)
+				return receipt, nil
 			})
 		},
 	}

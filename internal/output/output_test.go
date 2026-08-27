@@ -33,6 +33,41 @@ func writer(format Format, fields []string) (*Writer, *bytes.Buffer, *bytes.Buff
 	return &Writer{Format: format, Fields: fields, Out: out, Err: stderr}, out, stderr
 }
 
+type outputBoundaryWriter struct {
+	buffer         bytes.Buffer
+	writeErr       error
+	failFirstWrite bool
+	firstWriteSize int
+	failEveryWrite bool
+	writes         int
+}
+
+func (w *outputBoundaryWriter) Write(value []byte) (int, error) {
+	w.writes++
+	if w.failFirstWrite && w.writes == 1 {
+		return 0, w.writeErr
+	}
+	if w.firstWriteSize > 0 && w.writes == 1 {
+		n := min(w.firstWriteSize, len(value))
+		if _, err := w.buffer.Write(value[:n]); err != nil {
+			return 0, err
+		}
+		return n, w.writeErr
+	}
+	if w.failEveryWrite {
+		return 0, w.writeErr
+	}
+	return w.buffer.Write(value)
+}
+
+func (w *outputBoundaryWriter) Bytes() []byte {
+	return w.buffer.Bytes()
+}
+
+func (w *outputBoundaryWriter) String() string {
+	return w.buffer.String()
+}
+
 func decodeEnvelope(t *testing.T, out *bytes.Buffer) map[string]any {
 	t.Helper()
 	var env map[string]any
@@ -230,6 +265,103 @@ func TestFailureEnvelopeAndExitStatus(t *testing.T) {
 			}
 			if stderr.Len() != 0 {
 				t.Errorf("JSON failure wrote stderr: %q", stderr.String())
+			}
+		})
+	}
+}
+
+func TestJSONOutputBoundaryFailureDoesNotAppendOrLeak(t *testing.T) {
+	writeErr := errors.New("OUTPUT_WRITER_TOKEN_SENTINEL OUTPUT_WRITER_PATH_SENTINEL")
+	tests := []struct {
+		name          string
+		newOutput     func() *outputBoundaryWriter
+		outputStarted bool
+	}{
+		{
+			name: "partial first write does not append failure envelope",
+			newOutput: func() *outputBoundaryWriter {
+				return &outputBoundaryWriter{writeErr: writeErr, firstWriteSize: 1}
+			},
+			outputStarted: true,
+		},
+		{
+			name: "persistent zero byte failure leaves stdout empty",
+			newOutput: func() *outputBoundaryWriter {
+				return &outputBoundaryWriter{writeErr: writeErr, failEveryWrite: true}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stdout := test.newOutput()
+			stderr := &bytes.Buffer{}
+			w := &Writer{Format: FormatJSON, Out: stdout, Err: stderr}
+
+			successErr := w.Success(issue{key: "WL-1", summary: "safe"})
+			if successErr == nil {
+				t.Fatal("Success succeeded despite output boundary failure")
+			}
+			if code := w.Failure(errx.Conflict("WRITE_OUTCOME_UNKNOWN", "the write outcome is unknown").Wrap(successErr)); code != errx.CodeConflict {
+				t.Fatalf("failure exit code = %d, want %d", code, errx.CodeConflict)
+			}
+
+			if test.outputStarted {
+				if stdout.writes != 1 {
+					t.Fatalf("stdout writes = %d, want no second envelope after output started", stdout.writes)
+				}
+				if strings.Contains(stdout.String(), `"ok":false`) {
+					t.Fatalf("stdout appended a failure envelope after partial output: %q", stdout.String())
+				}
+			} else if len(stdout.Bytes()) != 0 {
+				t.Fatalf("persistent write failure produced stdout: %q", stdout.String())
+			}
+
+			combined := stdout.String() + stderr.String()
+			for _, sentinel := range []string{"OUTPUT_WRITER_TOKEN_SENTINEL", "OUTPUT_WRITER_PATH_SENTINEL"} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("output boundary failure leaked %q: stdout=%q stderr=%q", sentinel, stdout.String(), stderr.String())
+				}
+			}
+		})
+	}
+}
+
+func TestJSONFailureAfterZeroByteSuccessWriteUsesSafeInternalEnvelope(t *testing.T) {
+	writeErr := errors.New("ZERO_BYTE_TOKEN_SENTINEL ZERO_BYTE_PATH_SENTINEL")
+	tests := []struct {
+		name string
+	}{
+		{name: "first zero byte error then failure envelope succeeds"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stdout := &outputBoundaryWriter{writeErr: writeErr, failFirstWrite: true}
+			stderr := &bytes.Buffer{}
+			w := &Writer{Format: FormatJSON, Out: stdout, Err: stderr}
+
+			successErr := w.Success(issue{key: "WL-1", summary: "safe"})
+			if successErr == nil {
+				t.Fatal("Success succeeded despite the first write failing")
+			}
+			if code := w.Failure(successErr); code != errx.CodeInternal {
+				t.Fatalf("failure exit code = %d, want %d", code, errx.CodeInternal)
+			}
+			if stdout.writes != 2 {
+				t.Fatalf("stdout writes = %d, want failed success then one failure envelope", stdout.writes)
+			}
+
+			var envelope Envelope
+			if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+				t.Fatalf("decode failure envelope: %v\n%s", err, stdout.String())
+			}
+			if envelope.OK || envelope.Error == nil || envelope.Error.Code != "INTERNAL" {
+				t.Fatalf("envelope = %#v, want an INTERNAL failure envelope", envelope)
+			}
+			combined := stdout.String() + stderr.String()
+			for _, sentinel := range []string{"ZERO_BYTE_TOKEN_SENTINEL", "ZERO_BYTE_PATH_SENTINEL"} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("safe failure envelope leaked %q: stdout=%q stderr=%q", sentinel, stdout.String(), stderr.String())
+				}
 			}
 		})
 	}

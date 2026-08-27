@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -78,6 +79,559 @@ func TestAuthAllowProjectsCommandsStayLocalAndCanonical(t *testing.T) {
 				t.Fatal("credential leaked")
 			}
 		})
+	}
+}
+
+func TestPostLockReleaseFailureEmitsOnlyOneFailureEnvelope(t *testing.T) {
+	releaseErr := errors.New("POST_LOCK_RELEASE_SENTINEL")
+	tests := []struct {
+		name       string
+		args       []string
+		client     *fakeJira
+		wantCode   errx.Code
+		wantReason string
+		configure  func(*fakeRegistry, *fakePolicyRegistry)
+		assertDone func(*testing.T, *fakeJira, *fakePolicyRegistry)
+	}{
+		{
+			name:       "remote mutation profile lock release fails",
+			args:       []string{"--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"},
+			client:     &fakeJira{issue: jira.Issue{ID: "10001", Key: "WL-1"}, comment: jira.Comment{ID: "900"}},
+			wantCode:   errx.CodeConflict,
+			wantReason: "WRITE_OUTCOME_UNKNOWN",
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, client *fakeJira, _ *fakePolicyRegistry) {
+				if client.commentCalls != 1 {
+					t.Fatalf("comment calls = %d, want completed callback", client.commentCalls)
+				}
+			},
+		},
+		{
+			name:       "remote mutation policy lock release fails",
+			args:       []string{"--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"},
+			client:     &fakeJira{issue: jira.Issue{ID: "10001", Key: "WL-1"}, comment: jira.Comment{ID: "900"}},
+			wantCode:   errx.CodeConflict,
+			wantReason: "WRITE_OUTCOME_UNKNOWN",
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, client *fakeJira, _ *fakePolicyRegistry) {
+				if client.commentCalls != 1 {
+					t.Fatalf("comment calls = %d, want completed callback", client.commentCalls)
+				}
+			},
+		},
+		{
+			name:       "remote mutation dry run profile lock release fails",
+			args:       []string{"--dry-run", "comments", "add", "--issue", "WL-1", "--body", "safe"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, client *fakeJira, policies *fakePolicyRegistry) {
+				if client.totalMutationCalls() != 0 || policies.requires != 1 || policies.lockCallbacks != 1 {
+					t.Fatalf("dry-run callback = mutation calls:%d policy requires:%d lock callbacks:%d", client.totalMutationCalls(), policies.requires, policies.lockCallbacks)
+				}
+			},
+		},
+		{
+			name:       "remote mutation dry run policy lock release fails",
+			args:       []string{"--dry-run", "comments", "add", "--issue", "WL-1", "--body", "safe"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, client *fakeJira, policies *fakePolicyRegistry) {
+				if client.totalMutationCalls() != 0 || policies.requires != 1 || policies.lockCallbacks != 1 {
+					t.Fatalf("dry-run callback = mutation calls:%d policy requires:%d lock callbacks:%d", client.totalMutationCalls(), policies.requires, policies.lockCallbacks)
+				}
+			},
+		},
+		{
+			name:       "allow-projects show profile lock release fails",
+			args:       []string{"auth", "allow-projects", "show"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.gets != 1 {
+					t.Fatalf("policy gets = %d, want completed callback", policies.gets)
+				}
+			},
+		},
+		{
+			name:       "allow-projects show policy lock release fails",
+			args:       []string{"auth", "allow-projects", "show"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.gets != 1 {
+					t.Fatalf("policy gets = %d, want completed callback", policies.gets)
+				}
+			},
+		},
+		{
+			name:       "allow-projects set profile lock release fails",
+			args:       []string{"--yes", "auth", "allow-projects", "set", "--project", "WL"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeConflict,
+			wantReason: "WRITE_POLICY_OUTCOME_UNKNOWN",
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.sets != 1 {
+					t.Fatalf("policy sets = %d, want completed callback", policies.sets)
+				}
+			},
+		},
+		{
+			name:       "allow-projects set policy lock release fails",
+			args:       []string{"--yes", "auth", "allow-projects", "set", "--project", "WL"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeConflict,
+			wantReason: "WRITE_POLICY_OUTCOME_UNKNOWN",
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.sets != 1 {
+					t.Fatalf("policy sets = %d, want completed callback", policies.sets)
+				}
+			},
+		},
+		{
+			name:       "allow-projects set dry run profile lock release fails",
+			args:       []string{"--dry-run", "auth", "allow-projects", "set", "--project", "WL"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.sets != 0 || policies.lockCallbacks != 1 {
+					t.Fatalf("dry-run callback = policy sets:%d lock callbacks:%d", policies.sets, policies.lockCallbacks)
+				}
+			},
+		},
+		{
+			name:       "allow-projects set dry run policy lock release fails",
+			args:       []string{"--dry-run", "auth", "allow-projects", "set", "--project", "WL"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.sets != 0 || policies.lockCallbacks != 1 {
+					t.Fatalf("dry-run callback = policy sets:%d lock callbacks:%d", policies.sets, policies.lockCallbacks)
+				}
+			},
+		},
+		{
+			name:       "allow-projects clear profile lock release fails",
+			args:       []string{"--yes", "auth", "allow-projects", "clear"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeConflict,
+			wantReason: "WRITE_POLICY_OUTCOME_UNKNOWN",
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.clears != 1 {
+					t.Fatalf("policy clears = %d, want completed callback", policies.clears)
+				}
+			},
+		},
+		{
+			name:       "allow-projects clear policy lock release fails",
+			args:       []string{"--yes", "auth", "allow-projects", "clear"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeConflict,
+			wantReason: "WRITE_POLICY_OUTCOME_UNKNOWN",
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.clears != 1 {
+					t.Fatalf("policy clears = %d, want completed callback", policies.clears)
+				}
+			},
+		},
+		{
+			name:       "allow-projects clear dry run profile lock release fails",
+			args:       []string{"--dry-run", "auth", "allow-projects", "clear"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.clears != 0 || policies.lockCallbacks != 1 {
+					t.Fatalf("dry-run callback = policy clears:%d lock callbacks:%d", policies.clears, policies.lockCallbacks)
+				}
+			},
+		},
+		{
+			name:       "allow-projects clear dry run policy lock release fails",
+			args:       []string{"--dry-run", "auth", "allow-projects", "clear"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.clears != 0 || policies.lockCallbacks != 1 {
+					t.Fatalf("dry-run callback = policy clears:%d lock callbacks:%d", policies.clears, policies.lockCallbacks)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}
+			app, stdout, stderr := testApp(store, test.client)
+			registry := app.registry.(*fakeRegistry)
+			policies := app.policies.(*fakePolicyRegistry)
+			test.configure(registry, policies)
+
+			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json", "--profile", "work"}, test.args...))
+
+			if code != test.wantCode {
+				t.Fatalf("code = %d, want %d stdout=%s stderr=%s", code, test.wantCode, stdout.String(), stderr.String())
+			}
+			test.assertDone(t, test.client, policies)
+			assertSingleFailureEnvelope(t, stdout.Bytes(), test.wantReason)
+			if strings.Contains(stdout.String()+stderr.String(), releaseErr.Error()) {
+				t.Fatalf("lock release details leaked: stdout=%s stderr=%s", stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestSuccessOutputFailureAfterCompletedCallbackEmitsOnlyReconciliationFailure(t *testing.T) {
+	writeErr := errors.New("SUCCESS_OUTPUT_WRITE_SENTINEL")
+	tests := []struct {
+		name       string
+		args       []string
+		client     *fakeJira
+		wantCode   errx.Code
+		wantReason string
+		assertDone func(*testing.T, *fakeJira, *fakePolicyRegistry)
+	}{
+		{
+			name:       "real remote mutation",
+			args:       []string{"--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"},
+			client:     &fakeJira{issue: jira.Issue{ID: "10001", Key: "WL-1"}, comment: jira.Comment{ID: "900"}},
+			wantCode:   errx.CodeConflict,
+			wantReason: "WRITE_OUTCOME_UNKNOWN",
+			assertDone: func(t *testing.T, client *fakeJira, _ *fakePolicyRegistry) {
+				if client.commentCalls != 1 {
+					t.Fatalf("comment calls = %d, want applied mutation", client.commentCalls)
+				}
+			},
+		},
+		{
+			name:       "real policy set",
+			args:       []string{"--yes", "auth", "allow-projects", "set", "--project", "WL"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeConflict,
+			wantReason: "WRITE_POLICY_OUTCOME_UNKNOWN",
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.sets != 1 {
+					t.Fatalf("policy sets = %d, want applied mutation", policies.sets)
+				}
+			},
+		},
+		{
+			name:       "real policy clear",
+			args:       []string{"--yes", "auth", "allow-projects", "clear"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeConflict,
+			wantReason: "WRITE_POLICY_OUTCOME_UNKNOWN",
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.clears != 1 {
+					t.Fatalf("policy clears = %d, want applied mutation", policies.clears)
+				}
+			},
+		},
+		{
+			name:       "remote mutation dry run",
+			args:       []string{"--dry-run", "comments", "add", "--issue", "WL-1", "--body", "safe"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			assertDone: func(t *testing.T, client *fakeJira, policies *fakePolicyRegistry) {
+				if client.totalMutationCalls() != 0 || policies.requires != 1 {
+					t.Fatalf("dry-run callback = mutation calls:%d policy requires:%d", client.totalMutationCalls(), policies.requires)
+				}
+			},
+		},
+		{
+			name:       "policy set dry run",
+			args:       []string{"--dry-run", "auth", "allow-projects", "set", "--project", "WL"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.sets != 0 || policies.lockCallbacks != 1 {
+					t.Fatalf("dry-run callback = policy sets:%d lock callbacks:%d", policies.sets, policies.lockCallbacks)
+				}
+			},
+		},
+		{
+			name:       "policy clear dry run",
+			args:       []string{"--dry-run", "auth", "allow-projects", "clear"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.clears != 0 || policies.lockCallbacks != 1 {
+					t.Fatalf("dry-run callback = policy clears:%d lock callbacks:%d", policies.clears, policies.lockCallbacks)
+				}
+			},
+		},
+		{
+			name:       "policy show",
+			args:       []string{"auth", "allow-projects", "show"},
+			client:     &fakeJira{},
+			wantCode:   errx.CodeInternal,
+			wantReason: "INTERNAL",
+			assertDone: func(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+				if policies.gets != 1 || policies.lockCallbacks != 1 {
+					t.Fatalf("show callback = policy gets:%d lock callbacks:%d", policies.gets, policies.lockCallbacks)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}
+			app, _, stderr := testApp(store, test.client)
+			stdout := &failFirstWriteBuffer{writeErr: writeErr}
+			app.stdout = stdout
+			policies := app.policies.(*fakePolicyRegistry)
+
+			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json", "--profile", "work"}, test.args...))
+
+			if code != test.wantCode {
+				t.Fatalf("code = %d, want %d stdout=%s stderr=%s", code, test.wantCode, stdout.String(), stderr.String())
+			}
+			test.assertDone(t, test.client, policies)
+			if stdout.writes != 2 {
+				t.Fatalf("stdout writes = %d, want failed success plus accepted failure", stdout.writes)
+			}
+			assertSingleFailureEnvelope(t, stdout.Bytes(), test.wantReason)
+			combined := stdout.String() + stderr.String()
+			for _, sentinel := range []string{writeErr.Error(), store.credential.Token} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("output leaked %q: %s", sentinel, combined)
+				}
+			}
+		})
+	}
+}
+
+func TestMutationOutputBoundaryFailureKeepsWriteOutcomeUnknown(t *testing.T) {
+	writeErr := errors.New("OUTPUT_WRITER_TOKEN_SENTINEL OUTPUT_WRITER_PATH_SENTINEL")
+	tests := []struct {
+		name          string
+		newOutput     func() *outputBoundaryBuffer
+		outputStarted bool
+	}{
+		{
+			name: "partial first write does not append a second envelope",
+			newOutput: func() *outputBoundaryBuffer {
+				return &outputBoundaryBuffer{writeErr: writeErr, firstWriteSize: 1}
+			},
+			outputStarted: true,
+		},
+		{
+			name: "persistent zero byte failure leaves stdout empty",
+			newOutput: func() *outputBoundaryBuffer {
+				return &outputBoundaryBuffer{writeErr: writeErr, failEveryWrite: true}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}
+			client := &fakeJira{issue: jira.Issue{ID: "10001", Key: "WL-1"}, comment: jira.Comment{ID: "900"}}
+			app, _, stderr := testApp(store, client)
+			stdout := test.newOutput()
+			app.stdout = stdout
+
+			code := app.Run(context.Background(), app.NewRootCommand(), []string{"--output", "json", "--profile", "work", "--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"})
+
+			if code != errx.CodeConflict {
+				t.Fatalf("code = %d, want %d (write outcome unknown) stdout=%q stderr=%q", code, errx.CodeConflict, stdout.String(), stderr.String())
+			}
+			if client.commentCalls != 1 {
+				t.Fatalf("comment calls = %d, want exactly one applied mutation", client.commentCalls)
+			}
+			if test.outputStarted {
+				if stdout.writes != 1 {
+					t.Fatalf("stdout writes = %d, want no second envelope after output started", stdout.writes)
+				}
+				if strings.Contains(stdout.String(), `"ok":false`) {
+					t.Fatalf("stdout appended failure envelope after partial output: %q", stdout.String())
+				}
+			} else if stdout.String() != "" {
+				t.Fatalf("persistent output failure produced stdout: %q", stdout.String())
+			}
+
+			combined := stdout.String() + stderr.String()
+			for _, sentinel := range []string{"OUTPUT_WRITER_TOKEN_SENTINEL", "OUTPUT_WRITER_PATH_SENTINEL", store.credential.Token} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("output leaked %q: stdout=%q stderr=%q", sentinel, stdout.String(), stderr.String())
+				}
+			}
+		})
+	}
+}
+
+func TestPostCallbackLockTimeoutForNonMutatingPathsStaysInternal(t *testing.T) {
+	timeout := &lockfile.TimeoutError{Path: "POST_CALLBACK_TIMEOUT_PATH_SENTINEL", Timeout: time.Second}
+	releaseErr := fmt.Errorf("POST_CALLBACK_RELEASE_SENTINEL: %w", timeout)
+	tests := []struct {
+		name       string
+		args       []string
+		configure  func(*fakeRegistry, *fakePolicyRegistry)
+		assertDone func(*testing.T, *fakeJira, *fakePolicyRegistry)
+	}{
+		{
+			name: "remote dry run profile lock",
+			args: []string{"--dry-run", "comments", "add", "--issue", "WL-1", "--body", "safe"},
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: assertRemoteDryRunCallback,
+		},
+		{
+			name: "remote dry run policy lock",
+			args: []string{"--dry-run", "comments", "add", "--issue", "WL-1", "--body", "safe"},
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: assertRemoteDryRunCallback,
+		},
+		{
+			name: "policy set dry run profile lock",
+			args: []string{"--dry-run", "auth", "allow-projects", "set", "--project", "WL"},
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: assertPolicySetDryRunCallback,
+		},
+		{
+			name: "policy set dry run policy lock",
+			args: []string{"--dry-run", "auth", "allow-projects", "set", "--project", "WL"},
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: assertPolicySetDryRunCallback,
+		},
+		{
+			name: "policy clear dry run profile lock",
+			args: []string{"--dry-run", "auth", "allow-projects", "clear"},
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: assertPolicyClearDryRunCallback,
+		},
+		{
+			name: "policy clear dry run policy lock",
+			args: []string{"--dry-run", "auth", "allow-projects", "clear"},
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: assertPolicyClearDryRunCallback,
+		},
+		{
+			name: "policy show profile lock",
+			args: []string{"auth", "allow-projects", "show"},
+			configure: func(registry *fakeRegistry, _ *fakePolicyRegistry) {
+				registry.postLockErr = releaseErr
+			},
+			assertDone: assertPolicyShowCallback,
+		},
+		{
+			name: "policy show policy lock",
+			args: []string{"auth", "allow-projects", "show"},
+			configure: func(_ *fakeRegistry, policies *fakePolicyRegistry) {
+				policies.postLockErr = releaseErr
+			},
+			assertDone: assertPolicyShowCallback,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}
+			client := &fakeJira{}
+			app, stdout, stderr := testApp(store, client)
+			registry := app.registry.(*fakeRegistry)
+			policies := app.policies.(*fakePolicyRegistry)
+			test.configure(registry, policies)
+
+			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json", "--profile", "work"}, test.args...))
+
+			if code != errx.CodeInternal {
+				t.Fatalf("code = %d, want %d stdout=%s stderr=%s", code, errx.CodeInternal, stdout.String(), stderr.String())
+			}
+			test.assertDone(t, client, policies)
+			assertSingleFailureEnvelope(t, stdout.Bytes(), "INTERNAL")
+			combined := stdout.String() + stderr.String()
+			for _, sentinel := range []string{"LOCAL_LOCK_BUSY", "POST_CALLBACK_RELEASE_SENTINEL", timeout.Path, store.credential.Token} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("post-callback timeout leaked or was misclassified as %q: %s", sentinel, combined)
+				}
+			}
+		})
+	}
+}
+
+func assertRemoteDryRunCallback(t *testing.T, client *fakeJira, policies *fakePolicyRegistry) {
+	t.Helper()
+	if client.totalMutationCalls() != 0 || policies.requires != 1 || policies.lockCallbacks != 1 {
+		t.Fatalf("dry-run callback = mutation calls:%d policy requires:%d lock callbacks:%d", client.totalMutationCalls(), policies.requires, policies.lockCallbacks)
+	}
+}
+
+func assertPolicySetDryRunCallback(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+	t.Helper()
+	if policies.sets != 0 || policies.lockCallbacks != 1 {
+		t.Fatalf("dry-run callback = policy sets:%d lock callbacks:%d", policies.sets, policies.lockCallbacks)
+	}
+}
+
+func assertPolicyClearDryRunCallback(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+	t.Helper()
+	if policies.clears != 0 || policies.lockCallbacks != 1 {
+		t.Fatalf("dry-run callback = policy clears:%d lock callbacks:%d", policies.clears, policies.lockCallbacks)
+	}
+}
+
+func assertPolicyShowCallback(t *testing.T, _ *fakeJira, policies *fakePolicyRegistry) {
+	t.Helper()
+	if policies.gets != 1 || policies.lockCallbacks != 1 {
+		t.Fatalf("show callback = policy gets:%d lock callbacks:%d", policies.gets, policies.lockCallbacks)
 	}
 }
 
@@ -469,16 +1023,67 @@ func (f *fakeJira) totalCalls() int {
 }
 
 type fakePolicyRegistry struct {
-	mu         sync.Mutex
-	policy     writepolicy.Policy
-	requireErr error
-	lockErr    error
-	setErr     error
-	clearErr   error
-	gets       int
-	sets       int
-	clears     int
-	requires   int
+	mu            sync.Mutex
+	policy        writepolicy.Policy
+	requireErr    error
+	lockErr       error
+	postLockErr   error
+	setErr        error
+	clearErr      error
+	gets          int
+	sets          int
+	clears        int
+	requires      int
+	lockCallbacks int
+}
+
+type failFirstWriteBuffer struct {
+	buffer   strings.Builder
+	writeErr error
+	writes   int
+}
+
+type outputBoundaryBuffer struct {
+	buffer         strings.Builder
+	writeErr       error
+	firstWriteSize int
+	failEveryWrite bool
+	writes         int
+}
+
+func (w *outputBoundaryBuffer) Write(value []byte) (int, error) {
+	w.writes++
+	if w.firstWriteSize > 0 && w.writes == 1 {
+		n := min(w.firstWriteSize, len(value))
+		if _, err := w.buffer.Write(value[:n]); err != nil {
+			return 0, err
+		}
+		return n, w.writeErr
+	}
+	if w.failEveryWrite {
+		return 0, w.writeErr
+	}
+	return w.buffer.Write(value)
+}
+
+func (w *outputBoundaryBuffer) String() string {
+	return w.buffer.String()
+}
+
+func (w *failFirstWriteBuffer) Write(value []byte) (int, error) {
+	w.writes++
+	if w.writes == 1 {
+		return 0, w.writeErr
+	}
+	return w.buffer.Write(value)
+}
+
+func (w *failFirstWriteBuffer) Bytes() []byte {
+	return []byte(w.buffer.String())
+}
+
+func (w *failFirstWriteBuffer) String() string {
+	return w.buffer.String()
 }
 
 func (r *fakePolicyRegistry) WithPolicyLock(_ context.Context, _ string, fn func() error) error {
@@ -487,7 +1092,14 @@ func (r *fakePolicyRegistry) WithPolicyLock(_ context.Context, _ string, fn func
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return fn()
+	err := fn()
+	if err == nil {
+		r.lockCallbacks++
+	}
+	if r.postLockErr != nil {
+		return errors.Join(err, r.postLockErr)
+	}
+	return err
 }
 
 func (r *fakePolicyRegistry) Get(context.Context, string) (writepolicy.Policy, error) {

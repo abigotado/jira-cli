@@ -535,6 +535,21 @@ func assertErrorHintContains(t *testing.T, raw []byte, want string) {
 	}
 }
 
+func assertSingleFailureEnvelope(t *testing.T, raw []byte, reason string) {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("stdout contains %d envelopes, want exactly one failure envelope:\n%s", len(lines), raw)
+	}
+	var envelope output.Envelope
+	if err := json.Unmarshal([]byte(lines[0]), &envelope); err != nil {
+		t.Fatalf("decode envelope: %v\n%s", err, raw)
+	}
+	if envelope.OK || envelope.Data != nil || envelope.Error == nil || envelope.Error.Code != reason {
+		t.Fatalf("envelope = %#v, want only failure reason %q", envelope, reason)
+	}
+}
+
 type fakeRegistry struct {
 	mu          sync.Mutex
 	profiles    []profile.Profile

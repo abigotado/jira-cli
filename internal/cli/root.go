@@ -177,7 +177,7 @@ func (a *App) NewRootCommand() *cobra.Command {
 	return root
 }
 
-func (a *App) runMutation(ctx context.Context, projectKey, action string, fn func(jiraMutationClient, profile.Profile) error) error {
+func (a *App) runMutation(ctx context.Context, projectKey, action string, fn func(jiraMutationClient, profile.Profile) (mutationReceipt, error)) error {
 	if a.profileName == "" {
 		return errx.ProfileRequired()
 	}
@@ -187,6 +187,9 @@ func (a *App) runMutation(ctx context.Context, projectKey, action string, fn fun
 	if a.registry == nil || a.policies == nil {
 		return errx.Internal("profile or write policy registry is unavailable")
 	}
+	var receipt mutationReceipt
+	callbackCompleted := false
+	mutationApplied := false
 	err := a.registry.WithProfileLock(ctx, a.profileName, func() error {
 		selected, err := a.registry.Get(ctx, a.profileName)
 		if err != nil {
@@ -201,7 +204,9 @@ func (a *App) runMutation(ctx context.Context, projectKey, action string, fn fun
 			}
 			a.out.WithContext(selected.Name, selected.Site)
 			if a.dryRun {
-				return fn(nil, selected)
+				receipt, err = fn(nil, selected)
+				callbackCompleted = err == nil
+				return err
 			}
 			reader, err := a.loadClientLocked(ctx, selected)
 			if err != nil {
@@ -211,10 +216,28 @@ func (a *App) runMutation(ctx context.Context, projectKey, action string, fn fun
 			if !ok {
 				return errx.Internal("Jira client does not implement mutation operations")
 			}
-			return fn(client, selected)
+			receipt, err = fn(client, selected)
+			callbackCompleted = err == nil
+			mutationApplied = callbackCompleted
+			return err
 		})
 	})
-	return translateLocalLockBoundary(err)
+	if err != nil {
+		if mutationApplied {
+			return errx.WriteOutcomeUnknown(action).Wrap(err)
+		}
+		if callbackCompleted {
+			return protectedWorkFailure(err)
+		}
+		return translateLocalLockBoundary(err)
+	}
+	if err := a.out.Success(receipt); err != nil {
+		if mutationApplied {
+			return errx.WriteOutcomeUnknown(action).Wrap(err)
+		}
+		return protectedWorkFailure(err)
+	}
+	return nil
 }
 
 func (a *App) setup(cmd *cobra.Command, _ []string) error {
@@ -374,8 +397,7 @@ func translateWritePolicy(err error, profileName, projectKey string) error {
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return errx.Translate(err)
 	case writepolicy.WasCommitted(err):
-		return errx.Conflict("WRITE_POLICY_OUTCOME_UNKNOWN", "the local write policy may have been updated despite a durability-check failure").
-			WithHint("run 'jira-cli auth allow-projects show --profile %s' before deciding whether to repeat the change", profileName)
+		return writePolicyOutcomeUnknown(profileName).Wrap(err)
 	case errors.Is(err, writepolicy.ErrNotFound):
 		return errx.Permission("WRITE_POLICY_MISSING", "profile %q has no local write allowlist", profileName).
 			WithHint("run 'jira-cli auth allow-projects set --profile NAME --project KEY --yes'")
@@ -392,6 +414,15 @@ func translateWritePolicy(err error, profileName, projectKey string) error {
 	default:
 		return errx.Internal("local write policy operation failed")
 	}
+}
+
+func writePolicyOutcomeUnknown(profileName string) *errx.Error {
+	return errx.Conflict("WRITE_POLICY_OUTCOME_UNKNOWN", "the local write policy may have been updated despite a durability-check failure").
+		WithHint("run 'jira-cli auth allow-projects show --profile %s' before deciding whether to repeat the change", profileName)
+}
+
+func protectedWorkFailure(err error) error {
+	return errx.Internal("command could not finish safely after protected work completed").Wrap(err)
 }
 
 func isLockTimeout(err error) bool {

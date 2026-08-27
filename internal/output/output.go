@@ -119,6 +119,8 @@ type Writer struct {
 
 	profile string
 	site    string
+
+	stdoutStarted bool
 }
 
 // New builds a Writer over stdout and stderr.
@@ -241,18 +243,37 @@ func (w *Writer) Failure(err error) errx.Code {
 	}
 
 	env := Envelope{OK: false, V: errx.EnvelopeVersion, Error: body, Hint: hint}
-	if encodeErr := w.encode(env); encodeErr != nil {
-		_, _ = fmt.Fprintf(w.Err, "error: %s\n", body.Message)
-		_, _ = fmt.Fprintf(w.Err, "error: could not encode error envelope: %v\n", encodeErr)
+	if w.stdoutStarted || w.encode(env) != nil {
+		w.writeFailureDiagnostic()
 	}
 	return code
 }
 
 func (w *Writer) encode(value any) error {
-	if err := json.NewEncoder(w.Out).Encode(value); err != nil {
-		return errx.Internal("encode output: %v", err)
+	if err := json.NewEncoder(outputSink{writer: w}).Encode(value); err != nil {
+		return errx.Internal("could not render command output").Wrap(err)
 	}
 	return nil
+}
+
+func (w *Writer) write(p []byte) (int, error) {
+	n, err := w.Out.Write(p)
+	if n > 0 {
+		w.stdoutStarted = true
+	}
+	return n, err
+}
+
+func (w *Writer) writeFailureDiagnostic() {
+	_, _ = fmt.Fprintln(w.Err, "error: could not render error envelope") // A diagnostic write cannot affect the command result.
+}
+
+type outputSink struct {
+	writer *Writer
+}
+
+func (s outputSink) Write(p []byte) (int, error) {
+	return s.writer.write(p)
 }
 
 func (w *Writer) project(data any) (any, error) {
@@ -317,8 +338,8 @@ func (w *Writer) renderText(data any) error {
 				parts = append(parts, field.Value)
 			}
 		}
-		if _, err := fmt.Fprintln(w.Out, strings.Join(parts, "  ")); err != nil {
-			return errx.Internal("write output: %v", err)
+		if _, err := fmt.Fprintln(outputSink{writer: w}, strings.Join(parts, "  ")); err != nil {
+			return errx.Internal("could not render command output").Wrap(err)
 		}
 	}
 	return nil
