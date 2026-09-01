@@ -8,15 +8,35 @@ JSON mode writes one stable envelope to stdout and is the default when stdout is
 
 | Flag | Type | Description |
 | --- | --- | --- |
-| `--dry-run` | bool | preview a supported local change without applying it |
+| `--dry-run` | bool | preview a supported change without applying it or contacting Jira |
 | `--fields` | stringSlice | comma-separated fields to request and emit |
 | `-o, --output` | string | output format: text, json, or raw |
 | `--profile` | string | named Jira profile (required for every network command) |
 | `--timeout` | duration | abort the command after this duration |
 | `-v, --verbose` | bool | write redacted request activity to stderr |
-| `--yes` | bool | confirm a local overwrite or destructive action |
+| `--yes` | bool | confirm a supported mutation or local overwrite |
 
 ## Commands
+
+### `jira-cli auth allow-projects clear`
+
+Remove the current profile's local write policy
+
+No flags of its own.
+
+### `jira-cli auth allow-projects set`
+
+Replace the exact projects allowed for writes
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--project` | stringArray |  | exact Jira project key to allow (repeatable) |
+
+### `jira-cli auth allow-projects show`
+
+Show the current profile's non-secret write policy
+
+No flags of its own.
 
 ### `jira-cli auth list`
 
@@ -50,6 +70,15 @@ Show one profile and optionally validate its stored credential
 | --- | --- | --- | --- |
 | `--check` | bool |  | read the exact Keychain entry and call Jira /myself |
 
+### `jira-cli comments add`
+
+Add one bounded plain-text comment to an allowed issue
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--body` | string |  | bounded plain-text comment body |
+| `--issue` | string |  | exact uppercase Jira issue key |
+
 ### `jira-cli comments list`
 
 Read one comment page
@@ -65,6 +94,30 @@ Read one comment page
 Print the versioned envelope and exit-code contract
 
 No flags of its own.
+
+### `jira-cli issues create`
+
+Create one bounded issue in an allowed project
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--description` | string |  | bounded plain-text description |
+| `--issue-type-id` | string |  | exact numeric issue type ID |
+| `--label` | stringArray |  | bounded Jira label (repeatable, maximum 100) |
+| `--project` | string |  | exact uppercase Jira project key |
+| `--summary` | string |  | bounded one-line issue summary |
+
+### `jira-cli issues edit`
+
+Edit bounded fields on one exact allowed issue
+
+Usage: `jira-cli issues edit ISSUE_KEY`
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--clear-description` | bool |  | set the description to null |
+| `--description` | string |  | replacement bounded plain-text description |
+| `--summary` | string |  | replacement bounded one-line summary |
 
 ### `jira-cli issues get`
 
@@ -84,6 +137,16 @@ Run one enhanced JQL search page
 | `--jql` | string |  | bounded Jira Query Language expression |
 | `--limit` | int | `50` | maximum issues in this page (1-100) |
 
+### `jira-cli issues transition`
+
+Apply one exact currently available transition
+
+Usage: `jira-cli issues transition ISSUE_KEY`
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--transition-id` | string |  | exact numeric transition ID |
+
 ### `jira-cli issues transitions`
 
 Read currently available transitions for an issue
@@ -91,6 +154,16 @@ Read currently available transitions for an issue
 Usage: `jira-cli issues transitions ISSUE_KEY`
 
 No flags of its own.
+
+### `jira-cli issues types`
+
+List supported standard issue types for one exact project
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--cursor` | string |  | opaque cursor from meta.next_cursor |
+| `--limit` | int | `50` | maximum issue types in this page (1-100) |
+| `--project` | string |  | exact uppercase Jira project key |
 
 ### `jira-cli me`
 

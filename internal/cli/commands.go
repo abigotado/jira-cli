@@ -37,6 +37,7 @@ func (a *App) newAuthCommand() *cobra.Command {
 		a.newAuthListCommand(),
 		a.newAuthStatusCommand(),
 		a.newAuthLogoutCommand(),
+		a.newAuthAllowProjectsCommand(),
 	)
 	return command
 }
@@ -350,8 +351,16 @@ func (a *App) newProjectsGetCommand() *cobra.Command {
 }
 
 func (a *App) newIssuesCommand() *cobra.Command {
-	command := commandGroup("issues", "Read Jira issues")
-	command.AddCommand(a.newIssuesGetCommand(), a.newIssuesSearchCommand(), a.newIssuesTransitionsCommand())
+	command := commandGroup("issues", "Read and safely mutate Jira issues")
+	command.AddCommand(
+		a.newIssuesGetCommand(),
+		a.newIssuesSearchCommand(),
+		a.newIssuesTransitionsCommand(),
+		a.newIssueTypesCommand(),
+		a.newIssuesCreateCommand(),
+		a.newIssuesEditCommand(),
+		a.newIssuesTransitionCommand(),
+	)
 	return command
 }
 
@@ -455,8 +464,8 @@ func (a *App) newIssuesTransitionsCommand() *cobra.Command {
 }
 
 func (a *App) newCommentsCommand() *cobra.Command {
-	command := commandGroup("comments", "Read Jira issue comments")
-	command.AddCommand(a.newCommentsListCommand())
+	command := commandGroup("comments", "Read and safely add Jira issue comments")
+	command.AddCommand(a.newCommentsListCommand(), a.newCommentsAddCommand())
 	return command
 }
 

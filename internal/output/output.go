@@ -36,6 +36,14 @@ func ParseFormat(value string) (Format, error) {
 	}
 }
 
+// ValidateFormat checks cross-flag output constraints without rendering.
+func ValidateFormat(format Format, fields []string) error {
+	if format == FormatRaw && len(fields) > 0 {
+		return errx.Usage("--fields cannot be combined with --output raw")
+	}
+	return nil
+}
+
 // Field is one output-safe name/value pair for an entity.
 type Field struct {
 	// Name is the stable projection key.
@@ -111,6 +119,8 @@ type Writer struct {
 
 	profile string
 	site    string
+
+	stdoutStarted bool
 }
 
 // New builds a Writer over stdout and stderr.
@@ -124,6 +134,30 @@ func (w *Writer) WithContext(profile, site string) *Writer {
 	w.profile = profile
 	w.site = site
 	return w
+}
+
+// Validate checks the requested projection against a value's live output
+// vocabulary. Mutation commands call this before dispatching side effects.
+func (w *Writer) Validate(data any) error {
+	if err := ValidateFormat(w.Format, w.Fields); err != nil {
+		return err
+	}
+	if len(w.Fields) == 0 {
+		return nil
+	}
+	rows, _, ok := asRows(data)
+	if !ok {
+		return errx.Usage("--fields is not supported for this command")
+	}
+	if len(rows) > 0 {
+		_, err := selectFields(rows[0].Fields(), w.Fields)
+		return err
+	}
+	if schema := collectionSchema(data); schema != nil {
+		_, err := selectFields(schema.Fields(), w.Fields)
+		return err
+	}
+	return nil
 }
 
 // DefaultFormat returns JSON unless stdout is a terminal.
@@ -147,13 +181,13 @@ func (w *Writer) SuccessPage(data any, truncated bool, nextCursor string) error 
 }
 
 func (w *Writer) success(data any, truncated bool, nextCursor string, paged bool) error {
+	if err := w.Validate(data); err != nil {
+		return err
+	}
 	switch w.Format {
 	case FormatText:
 		return w.renderText(data)
 	case FormatRaw:
-		if len(w.Fields) > 0 {
-			return errx.Usage("--fields cannot be combined with --output raw")
-		}
 		return w.encode(data)
 	case FormatJSON:
 		payload, err := w.project(data)
@@ -209,18 +243,37 @@ func (w *Writer) Failure(err error) errx.Code {
 	}
 
 	env := Envelope{OK: false, V: errx.EnvelopeVersion, Error: body, Hint: hint}
-	if encodeErr := w.encode(env); encodeErr != nil {
-		_, _ = fmt.Fprintf(w.Err, "error: %s\n", body.Message)
-		_, _ = fmt.Fprintf(w.Err, "error: could not encode error envelope: %v\n", encodeErr)
+	if w.stdoutStarted || w.encode(env) != nil {
+		w.writeFailureDiagnostic()
 	}
 	return code
 }
 
 func (w *Writer) encode(value any) error {
-	if err := json.NewEncoder(w.Out).Encode(value); err != nil {
-		return errx.Internal("encode output: %v", err)
+	if err := json.NewEncoder(outputSink{writer: w}).Encode(value); err != nil {
+		return errx.Internal("could not render command output").Wrap(err)
 	}
 	return nil
+}
+
+func (w *Writer) write(p []byte) (int, error) {
+	n, err := w.Out.Write(p)
+	if n > 0 {
+		w.stdoutStarted = true
+	}
+	return n, err
+}
+
+func (w *Writer) writeFailureDiagnostic() {
+	_, _ = fmt.Fprintln(w.Err, "error: could not render error envelope") // A diagnostic write cannot affect the command result.
+}
+
+type outputSink struct {
+	writer *Writer
+}
+
+func (s outputSink) Write(p []byte) (int, error) {
+	return s.writer.write(p)
 }
 
 func (w *Writer) project(data any) (any, error) {
@@ -285,8 +338,8 @@ func (w *Writer) renderText(data any) error {
 				parts = append(parts, field.Value)
 			}
 		}
-		if _, err := fmt.Fprintln(w.Out, strings.Join(parts, "  ")); err != nil {
-			return errx.Internal("write output: %v", err)
+		if _, err := fmt.Fprintln(outputSink{writer: w}, strings.Join(parts, "  ")); err != nil {
+			return errx.Internal("could not render command output").Wrap(err)
 		}
 	}
 	return nil

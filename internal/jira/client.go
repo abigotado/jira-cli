@@ -1,4 +1,4 @@
-// Package jira is a hardened, read-only Jira Cloud REST v3 client.
+// Package jira is a hardened Jira Cloud REST v3 client.
 //
 // Credentials are passed in as values so this package stays independent of
 // credential storage. Request URLs never contain credentials, redirects are
@@ -29,7 +29,10 @@ const (
 	maxDrainBody    = 64 << 10
 )
 
-var classicHostPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.atlassian\.net$`)
+var (
+	classicHostPattern    = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.atlassian\.net$`)
+	errTransitionRejected = errors.New("Jira rejected the transition")
+)
 
 // TokenKind selects the Atlassian endpoint required by an API token.
 type TokenKind string
@@ -164,14 +167,31 @@ func refuseRedirect(_ *http.Request, _ []*http.Request) error {
 }
 
 type request struct {
-	method    string
-	path      string
-	query     url.Values
-	body      any
-	retrySafe bool
+	method     string
+	path       string
+	query      url.Values
+	body       any
+	policy     requestPolicy
+	operation  string
+	notFound   string
+	wantStatus int
 }
 
+type requestPolicy uint8
+
+const (
+	requestPolicyUnspecified requestPolicy = iota
+	requestPolicyRead
+	requestPolicyWrite
+)
+
 func (client *Client) do(ctx context.Context, request request, out any) error {
+	if request.policy != requestPolicyRead && request.policy != requestPolicyWrite {
+		return errx.Internal("Jira request has an invalid retry policy")
+	}
+	if request.policy == requestPolicyWrite && (request.wantStatus < http.StatusOK || request.wantStatus >= http.StatusMultipleChoices) {
+		return errx.Internal("Jira write request has no exact expected status")
+	}
 	var payload []byte
 	if request.body != nil {
 		var err error
@@ -182,14 +202,24 @@ func (client *Client) do(ctx context.Context, request request, out any) error {
 	}
 
 	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
+	attempts := maxAttempts
+	if request.policy != requestPolicyRead {
+		attempts = 1
+	}
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return errx.Translate(err)
+		}
 		response, err := client.send(ctx, request, payload)
 		if err != nil {
+			if request.policy == requestPolicyWrite {
+				return errx.WriteOutcomeUnknown(request.operation).Wrap(err)
+			}
 			if ctx.Err() != nil {
 				return errx.Translate(ctx.Err())
 			}
 			lastErr = errx.Retryable("NETWORK", 0, "could not reach Jira")
-			if !request.retrySafe || attempt == maxAttempts {
+			if attempt == attempts {
 				return lastErr
 			}
 			if err := client.sleep(ctx, retryBackoff(attempt)); err != nil {
@@ -203,7 +233,7 @@ func (client *Client) do(ctx context.Context, request request, out any) error {
 			return nil
 		}
 		lastErr = translated
-		if !retry || !request.retrySafe || attempt == maxAttempts {
+		if !retry || request.policy != requestPolicyRead || attempt == attempts {
 			return translated
 		}
 		delay := retryAfter
@@ -254,20 +284,38 @@ func (client *Client) handle(response *http.Response, request request, out any) 
 
 	body, tooLarge, readErr := readBounded(response.Body, maxResponseBody)
 	if readErr != nil {
+		if request.policy == requestPolicyWrite {
+			return 0, false, errx.WriteOutcomeUnknown(request.operation).Wrap(readErr)
+		}
 		return 0, false, errx.Internal("could not read Jira response")
 	}
 	if tooLarge {
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 			return client.translateStatus(response, request, nil)
 		}
+		if request.policy == requestPolicyWrite {
+			return 0, false, errx.WriteOutcomeUnknown(request.operation)
+		}
 		return 0, false, errx.Internal("Jira response exceeds the %d-byte safety limit", maxResponseBody)
 	}
 
 	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-		if out == nil || len(bytes.TrimSpace(body)) == 0 {
+		if request.policy == requestPolicyWrite && response.StatusCode != request.wantStatus {
+			return 0, false, errx.WriteOutcomeUnknown(request.operation)
+		}
+		if out == nil {
+			return 0, false, nil
+		}
+		if len(bytes.TrimSpace(body)) == 0 {
+			if request.policy == requestPolicyWrite {
+				return 0, false, errx.WriteOutcomeUnknown(request.operation)
+			}
 			return 0, false, nil
 		}
 		if err := json.Unmarshal(body, out); err != nil {
+			if request.policy == requestPolicyWrite {
+				return 0, false, errx.WriteOutcomeUnknown(request.operation).Wrap(err)
+			}
 			return 0, false, errx.Internal("Jira returned an invalid JSON response")
 		}
 		return 0, false, nil
@@ -288,12 +336,25 @@ func (client *Client) translateStatus(response *http.Response, request request, 
 		return 0, false, errx.Permission("PERMISSION_DENIED", "the Jira account does not have permission for this operation")
 
 	case http.StatusNotFound:
-		return 0, false, errx.NotFound(resourceKind(request.path), "requested", nil)
+		if request.policy == requestPolicyWrite {
+			return 0, false, writeConflict(request.operation)
+		}
+		kind := request.notFound
+		if kind == "" {
+			kind = resourceKind(request.path)
+		}
+		return 0, false, errx.NotFound(kind, "requested", nil)
 
-	case http.StatusConflict:
-		return 0, false, errx.Conflict("CONFLICT", "Jira rejected the request because the resource changed")
+	case http.StatusConflict, http.StatusPreconditionFailed:
+		return 0, false, writeConflict(request.operation)
+
+	case http.StatusRequestEntityTooLarge:
+		return 0, false, errx.PayloadTooLarge(request.operation)
 
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		if request.operation == "issues.transition" {
+			return 0, false, errTransitionRejected
+		}
 		return 0, false, errx.Usage("Jira rejected the request parameters")
 
 	case http.StatusTooManyRequests:
@@ -301,10 +362,28 @@ func (client *Client) translateStatus(response *http.Response, request request, 
 		return delay, true, errx.Retryable("RATE_LIMITED", delay, "Jira rate limit reached")
 
 	default:
+		if request.policy == requestPolicyWrite {
+			return 0, false, errx.WriteOutcomeUnknown(request.operation)
+		}
 		if response.StatusCode >= http.StatusInternalServerError {
 			return 0, true, errx.Retryable("SERVER_ERROR", 0, "Jira is temporarily unavailable")
 		}
 		return 0, false, errx.Internal("Jira returned unexpected HTTP status %d", response.StatusCode)
+	}
+}
+
+func writeConflict(operation string) *errx.Error {
+	switch operation {
+	case "issues.create":
+		return errx.Conflict("ISSUE_CREATE_CONFLICT", "Jira rejected issue creation because related state changed")
+	case "issues.edit":
+		return errx.Conflict("ISSUE_EDIT_CONFLICT", "Jira rejected the edit because the issue changed")
+	case "issues.transition":
+		return errx.Conflict("TRANSITION_CONFLICT", "Jira rejected the transition because workflow state changed")
+	case "comments.add":
+		return errx.Conflict("COMMENT_CONFLICT", "Jira rejected the comment because the issue changed")
+	default:
+		return errx.Conflict("CONFLICT", "Jira rejected the request because the resource changed")
 	}
 }
 

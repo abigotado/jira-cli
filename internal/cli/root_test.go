@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -13,8 +15,10 @@ import (
 	"github.com/abigotado/jira-cli/internal/auth"
 	"github.com/abigotado/jira-cli/internal/errx"
 	"github.com/abigotado/jira-cli/internal/jira"
+	"github.com/abigotado/jira-cli/internal/lockfile"
 	"github.com/abigotado/jira-cli/internal/output"
 	"github.com/abigotado/jira-cli/internal/profile"
+	"github.com/abigotado/jira-cli/internal/writepolicy"
 )
 
 func TestNetworkCommandRequiresExplicitProfileWithoutReadingCredential(t *testing.T) {
@@ -213,6 +217,208 @@ func TestExpiredProfileFailsBeforeKeychainLoad(t *testing.T) {
 	assertErrorReason(t, stdout.Bytes(), "TOKEN_EXPIRED")
 }
 
+func TestReadAndWriteCommandsShareExpiredProfileBoundary(t *testing.T) {
+	expires := time.Date(2026, time.August, 24, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "read", args: []string{"--profile", "work", "me"}},
+		{name: "write", args: []string{"--profile", "work", "--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}
+			client := &fakeJira{}
+			app, stdout, _ := testApp(store, client)
+			app.now = func() time.Time { return expires }
+			app.registry.(*fakeRegistry).profiles[0].ExpiresAt = &expires
+			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json"}, test.args...))
+			if code != errx.CodeAuth {
+				t.Fatalf("code = %d, want %d stdout=%s", code, errx.CodeAuth, stdout.String())
+			}
+			assertErrorReason(t, stdout.Bytes(), "TOKEN_EXPIRED")
+			if store.loads != 0 || client.totalCalls() != 0 {
+				t.Fatalf("expired profile crossed credential/Jira boundary: loads=%d calls=%d", store.loads, client.totalCalls())
+			}
+		})
+	}
+}
+
+func TestReadAndWriteCommandsShareCredentialLoadBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "read", args: []string{"--profile", "work", "me"}},
+		{name: "write", args: []string{"--profile", "work", "--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{}
+			client := &fakeJira{}
+			app, stdout, _ := testApp(store, client)
+			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json"}, test.args...))
+			if code != errx.CodeAuth {
+				t.Fatalf("code = %d, want %d stdout=%s", code, errx.CodeAuth, stdout.String())
+			}
+			assertErrorReason(t, stdout.Bytes(), "CREDENTIAL_NOT_FOUND")
+			if store.loads != 1 || client.totalCalls() != 0 {
+				t.Fatalf("credential boundary = loads:%d Jira calls:%d, want loads:1 calls:0", store.loads, client.totalCalls())
+			}
+		})
+	}
+}
+
+func TestLocalLockTimeoutIsRetryableBeforeCredentialsOrJira(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		profileErr error
+		policyErr  error
+		setErr     error
+		clearErr   error
+		wantSets   int
+		wantClears int
+	}{
+		{name: "read profile lock", args: []string{"--profile", "work", "me"}, profileErr: &lockfile.TimeoutError{Path: "PROFILE_LOCK_PATH_SENTINEL", Timeout: time.Second}},
+		{name: "write profile lock", args: []string{"--profile", "work", "--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"}, profileErr: &lockfile.TimeoutError{Path: "PROFILE_LOCK_PATH_SENTINEL", Timeout: time.Second}},
+		{name: "write policy lock", args: []string{"--profile", "work", "--yes", "comments", "add", "--issue", "WL-1", "--body", "safe"}, policyErr: &lockfile.TimeoutError{Path: "POLICY_LOCK_PATH_SENTINEL", Timeout: time.Second}},
+		{name: "set profile lock", args: []string{"--profile", "work", "--yes", "auth", "allow-projects", "set", "--project", "WL"}, profileErr: &lockfile.TimeoutError{Path: "PROFILE_LOCK_PATH_SENTINEL", Timeout: time.Second}},
+		{name: "set policy lock", args: []string{"--profile", "work", "--yes", "auth", "allow-projects", "set", "--project", "WL"}, policyErr: &lockfile.TimeoutError{Path: "POLICY_LOCK_PATH_SENTINEL", Timeout: time.Second}},
+		{name: "set local mutation lock", args: []string{"--profile", "work", "--yes", "auth", "allow-projects", "set", "--project", "WL"}, setErr: &lockfile.TimeoutError{Path: "SET_LOCK_PATH_SENTINEL", Timeout: time.Second}, wantSets: 1},
+		{name: "clear profile lock", args: []string{"--profile", "work", "--yes", "auth", "allow-projects", "clear"}, profileErr: &lockfile.TimeoutError{Path: "PROFILE_LOCK_PATH_SENTINEL", Timeout: time.Second}},
+		{name: "clear policy lock", args: []string{"--profile", "work", "--yes", "auth", "allow-projects", "clear"}, policyErr: &lockfile.TimeoutError{Path: "POLICY_LOCK_PATH_SENTINEL", Timeout: time.Second}},
+		{name: "clear local mutation lock", args: []string{"--profile", "work", "--yes", "auth", "allow-projects", "clear"}, clearErr: &lockfile.TimeoutError{Path: "CLEAR_LOCK_PATH_SENTINEL", Timeout: time.Second}, wantClears: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{credential: auth.Credential{Token: "KEYCHAIN_TOKEN_SENTINEL"}}
+			client := &fakeJira{}
+			app, stdout, stderr := testApp(store, client)
+			app.registry.(*fakeRegistry).lockErr = test.profileErr
+			policies := app.policies.(*fakePolicyRegistry)
+			policies.lockErr = test.policyErr
+			policies.setErr = test.setErr
+			policies.clearErr = test.clearErr
+			beforePolicy := strings.Join(policies.policy.Projects, ",")
+			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json"}, test.args...))
+			if code != errx.CodeRetryable {
+				t.Fatalf("code = %d, want %d stdout=%s", code, errx.CodeRetryable, stdout.String())
+			}
+			assertErrorReason(t, stdout.Bytes(), "LOCAL_LOCK_BUSY")
+			if store.loads != 0 || client.totalCalls() != 0 {
+				t.Fatalf("lock timeout crossed credential/Jira boundary: loads=%d calls=%d", store.loads, client.totalCalls())
+			}
+			if policies.sets != test.wantSets || policies.clears != test.wantClears {
+				t.Fatalf("policy mutation calls = set:%d clear:%d, want set:%d clear:%d", policies.sets, policies.clears, test.wantSets, test.wantClears)
+			}
+			if got := strings.Join(policies.policy.Projects, ","); got != beforePolicy {
+				t.Fatalf("lock timeout changed policy from %q to %q", beforePolicy, got)
+			}
+			combined := stdout.String() + stderr.String()
+			for _, sentinel := range []string{"PROFILE_LOCK_PATH_SENTINEL", "POLICY_LOCK_PATH_SENTINEL", "SET_LOCK_PATH_SENTINEL", "CLEAR_LOCK_PATH_SENTINEL", store.credential.Token} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("output leaked %q: %s", sentinel, combined)
+				}
+			}
+		})
+	}
+}
+
+func TestPostCredentialTransactionTimeoutIsNotReportedAsLockBusy(t *testing.T) {
+	timeout := &lockfile.TimeoutError{Path: "POST_OPERATION_LOCK_PATH_SENTINEL", Timeout: time.Second}
+	tests := []struct {
+		name             string
+		args             []string
+		stdin            string
+		configure        func(*fakeStore, *fakeRegistry)
+		assertFinalState func(*testing.T, *fakeStore, *fakeRegistry)
+	}{
+		{
+			name:  "wrapped timeout after login credential save",
+			args:  []string{"--profile", "work", "--yes", "auth", "login", "--site", "https://example.atlassian.net", "--email", "user@example.com", "--token-stdin"},
+			stdin: "NEW_LOGIN_TOKEN_SENTINEL\n",
+			configure: func(_ *fakeStore, registry *fakeRegistry) {
+				registry.postLockErr = fmt.Errorf("release profile lock: %w", timeout)
+			},
+			assertFinalState: func(t *testing.T, store *fakeStore, registry *fakeRegistry) {
+				if store.saves != 1 || store.credential.Token != "NEW_LOGIN_TOKEN_SENTINEL" {
+					t.Fatalf("login state = saves:%d credential:%v, want saved replacement", store.saves, store.credential)
+				}
+				if len(registry.profiles) != 1 {
+					t.Fatalf("profiles = %#v, want existing coherent profile", registry.profiles)
+				}
+			},
+		},
+		{
+			name:  "joined timeout after login credential save",
+			args:  []string{"--profile", "work", "--yes", "auth", "login", "--site", "https://example.atlassian.net", "--email", "user@example.com", "--token-stdin"},
+			stdin: "NEW_LOGIN_TOKEN_SENTINEL\n",
+			configure: func(_ *fakeStore, registry *fakeRegistry) {
+				registry.postLockErr = errors.Join(errors.New("release profile lock failed"), timeout)
+			},
+			assertFinalState: func(t *testing.T, store *fakeStore, _ *fakeRegistry) {
+				if store.saves != 1 || store.credential.Token != "NEW_LOGIN_TOKEN_SENTINEL" {
+					t.Fatalf("login state = saves:%d credential:%v, want saved replacement", store.saves, store.credential)
+				}
+			},
+		},
+		{
+			name: "wrapped timeout after logout delete and metadata removal",
+			args: []string{"--profile", "work", "--yes", "auth", "logout"},
+			configure: func(_ *fakeStore, registry *fakeRegistry) {
+				registry.postLockErr = fmt.Errorf("release profile lock: %w", timeout)
+			},
+			assertFinalState: func(t *testing.T, store *fakeStore, registry *fakeRegistry) {
+				if store.deletes != 1 || store.credential.Token != "" || len(registry.profiles) != 0 {
+					t.Fatalf("logout state = deletes:%d credential:%v profiles:%#v, want applied removal", store.deletes, store.credential, registry.profiles)
+				}
+			},
+		},
+		{
+			name: "joined timeout from failed logout compensation",
+			args: []string{"--profile", "work", "--yes", "auth", "logout"},
+			configure: func(store *fakeStore, registry *fakeRegistry) {
+				registry.removeErr = errors.New("profile metadata removal failed")
+				store.saveErr = fmt.Errorf("restore credential: %w", timeout)
+			},
+			assertFinalState: func(t *testing.T, store *fakeStore, registry *fakeRegistry) {
+				if store.deletes != 1 || store.saves != 1 || store.credential.Token != "" {
+					t.Fatalf("compensation state = deletes:%d saves:%d credential:%v, want explicit failed restore", store.deletes, store.saves, store.credential)
+				}
+				if len(registry.profiles) != 1 {
+					t.Fatalf("profile metadata changed despite pre-commit failure: %#v", registry.profiles)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &fakeStore{credential: auth.Credential{Token: "OLD_CREDENTIAL_SENTINEL"}}
+			app, stdout, stderr := testApp(store, &fakeJira{})
+			registry := app.registry.(*fakeRegistry)
+			test.configure(store, registry)
+			app.stdin = bytes.NewBufferString(test.stdin)
+			code := app.Run(context.Background(), app.NewRootCommand(), append([]string{"--output", "json"}, test.args...))
+			if code != errx.CodeInternal {
+				t.Fatalf("code = %d, want %d stdout=%s stderr=%s", code, errx.CodeInternal, stdout.String(), stderr.String())
+			}
+			assertErrorReason(t, stdout.Bytes(), "INTERNAL")
+			if strings.Contains(stdout.String(), "LOCAL_LOCK_BUSY") {
+				t.Fatalf("post-operation timeout was misreported as retryable: %s", stdout.String())
+			}
+			test.assertFinalState(t, store, registry)
+			combined := stdout.String() + stderr.String()
+			for _, sentinel := range []string{"POST_OPERATION_LOCK_PATH_SENTINEL", "NEW_LOGIN_TOKEN_SENTINEL", "OLD_CREDENTIAL_SENTINEL"} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("output leaked %q: %s", sentinel, combined)
+				}
+			}
+		})
+	}
+}
+
 func TestRawIssueOutputsPreserveModeledData(t *testing.T) {
 	t.Parallel()
 
@@ -289,6 +495,13 @@ func testApp(store *fakeStore, reader *fakeJira) (*App, *bytes.Buffer, *bytes.Bu
 		registry: &fakeRegistry{profiles: []profile.Profile{{
 			Name: "work", Site: "https://example.atlassian.net", Email: "user@example.com", TokenKind: profile.TokenKindClassic,
 		}}},
+		policies: &fakePolicyRegistry{policy: writepolicy.Policy{
+			Profile: "work",
+			Identity: writepolicy.Identity{
+				Site: "https://example.atlassian.net", Email: "user@example.com", TokenKind: string(profile.TokenKindClassic),
+			},
+			Projects: []string{"FL", "WL"},
+		}},
 		store:  store,
 		stdin:  bytes.NewBuffer(nil),
 		stdout: stdout,
@@ -311,18 +524,56 @@ func assertErrorReason(t *testing.T, raw []byte, reason string) {
 	}
 }
 
+func assertErrorHintContains(t *testing.T, raw []byte, want string) {
+	t.Helper()
+	var envelope output.Envelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode envelope: %v\n%s", err, raw)
+	}
+	if !strings.Contains(envelope.Hint, want) {
+		t.Fatalf("hint = %q, want substring %q", envelope.Hint, want)
+	}
+}
+
+func assertSingleFailureEnvelope(t *testing.T, raw []byte, reason string) {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("stdout contains %d envelopes, want exactly one failure envelope:\n%s", len(lines), raw)
+	}
+	var envelope output.Envelope
+	if err := json.Unmarshal([]byte(lines[0]), &envelope); err != nil {
+		t.Fatalf("decode envelope: %v\n%s", err, raw)
+	}
+	if envelope.OK || envelope.Data != nil || envelope.Error == nil || envelope.Error.Code != reason {
+		t.Fatalf("envelope = %#v, want only failure reason %q", envelope, reason)
+	}
+}
+
 type fakeRegistry struct {
-	mu       sync.Mutex
-	profiles []profile.Profile
+	mu          sync.Mutex
+	profiles    []profile.Profile
+	lockErr     error
+	postLockErr error
+	addErr      error
+	putErr      error
+	removeErr   error
 }
 
 func (r *fakeRegistry) List(context.Context) ([]profile.Profile, error) {
 	return append([]profile.Profile(nil), r.profiles...), nil
 }
 func (r *fakeRegistry) WithProfileLock(_ context.Context, _ string, fn func() error) error {
+	if r.lockErr != nil {
+		return r.lockErr
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return fn()
+	err := fn()
+	if r.postLockErr != nil {
+		return errors.Join(err, r.postLockErr)
+	}
+	return err
 }
 func (r *fakeRegistry) Get(_ context.Context, name string) (profile.Profile, error) {
 	for _, candidate := range r.profiles {
@@ -333,10 +584,16 @@ func (r *fakeRegistry) Get(_ context.Context, name string) (profile.Profile, err
 	return profile.Profile{}, profile.ErrNotFound
 }
 func (r *fakeRegistry) Add(_ context.Context, value profile.Profile) error {
+	if r.addErr != nil {
+		return r.addErr
+	}
 	r.profiles = append(r.profiles, value)
 	return nil
 }
 func (r *fakeRegistry) Put(_ context.Context, value profile.Profile) error {
+	if r.putErr != nil {
+		return r.putErr
+	}
 	for index := range r.profiles {
 		if r.profiles[index].Name == value.Name {
 			r.profiles[index] = value
@@ -347,6 +604,9 @@ func (r *fakeRegistry) Put(_ context.Context, value profile.Profile) error {
 	return nil
 }
 func (r *fakeRegistry) Remove(_ context.Context, name string) error {
+	if r.removeErr != nil {
+		return r.removeErr
+	}
 	for index := range r.profiles {
 		if r.profiles[index].Name == name {
 			r.profiles = append(r.profiles[:index], r.profiles[index+1:]...)
@@ -358,6 +618,8 @@ func (r *fakeRegistry) Remove(_ context.Context, name string) error {
 
 type fakeStore struct {
 	credential auth.Credential
+	saveErr    error
+	deleteErr  error
 	loads      int
 	saves      int
 	deletes    int
@@ -372,11 +634,17 @@ func (s *fakeStore) Load(context.Context, string) (auth.Credential, error) {
 }
 func (s *fakeStore) Save(_ context.Context, _ string, credential auth.Credential) error {
 	s.saves++
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	s.credential = credential
 	return nil
 }
 func (s *fakeStore) Delete(context.Context, string) error {
 	s.deletes++
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
 	if s.credential.Token == "" {
 		return auth.ErrNotFound
 	}
@@ -385,10 +653,33 @@ func (s *fakeStore) Delete(context.Context, string) error {
 }
 
 type fakeJira struct {
-	searchPage    jira.SearchPage
-	searchRequest jira.SearchRequest
-	panicValue    any
-	issue         jira.Issue
+	searchPage         jira.SearchPage
+	searchRequest      jira.SearchRequest
+	panicValue         any
+	issue              jira.Issue
+	issueSequence      []jira.Issue
+	project            jira.Project
+	issueTypes         jira.IssueTypePage
+	issueTypeProjectID string
+	issueTypeOptions   jira.IssueTypePageOptions
+	transitions        []jira.Transition
+	created            jira.Issue
+	comment            jira.Comment
+	projectCalls       int
+	issueCalls         int
+	typeCalls          int
+	createCalls        int
+	editCalls          int
+	transitionCalls    int
+	commentCalls       int
+	createInput        jira.CreateIssueRequest
+	createErr          error
+	editIssueID        string
+	editInput          jira.EditIssueRequest
+	transitionIssueID  string
+	transitionID       string
+	commentIssueID     string
+	commentBody        string
 }
 
 func (f *fakeJira) Myself(context.Context) (jira.User, error) {
@@ -400,17 +691,58 @@ func (f *fakeJira) Myself(context.Context) (jira.User, error) {
 func (*fakeJira) Projects(context.Context, jira.ProjectPageOptions) (jira.ProjectPage, error) {
 	return jira.ProjectPage{}, nil
 }
-func (*fakeJira) Project(context.Context, string) (jira.Project, error) {
-	return jira.Project{}, nil
+func (f *fakeJira) Project(context.Context, string) (jira.Project, error) {
+	f.projectCalls++
+	return f.project, nil
 }
 func (f *fakeJira) Issue(context.Context, string, []string) (jira.Issue, error) {
+	f.issueCalls++
+	if len(f.issueSequence) > 0 {
+		index := f.issueCalls - 1
+		if index >= len(f.issueSequence) {
+			index = len(f.issueSequence) - 1
+		}
+		return f.issueSequence[index], nil
+	}
 	return f.issue, nil
 }
 func (f *fakeJira) Search(_ context.Context, request jira.SearchRequest) (jira.SearchPage, error) {
 	f.searchRequest = request
 	return f.searchPage, nil
 }
-func (*fakeJira) Transitions(context.Context, string) ([]jira.Transition, error) { return nil, nil }
+func (f *fakeJira) Transitions(context.Context, string) ([]jira.Transition, error) {
+	return f.transitions, nil
+}
 func (*fakeJira) Comments(context.Context, string, jira.CommentPageOptions) (jira.CommentPage, error) {
 	return jira.CommentPage{}, nil
+}
+
+func (f *fakeJira) IssueTypes(_ context.Context, projectID string, options jira.IssueTypePageOptions) (jira.IssueTypePage, error) {
+	f.typeCalls++
+	f.issueTypeProjectID, f.issueTypeOptions = projectID, options
+	return f.issueTypes, nil
+}
+
+func (f *fakeJira) CreateIssue(_ context.Context, input jira.CreateIssueRequest) (jira.Issue, error) {
+	f.createCalls++
+	f.createInput = input
+	return f.created, f.createErr
+}
+
+func (f *fakeJira) EditIssue(_ context.Context, issueID string, input jira.EditIssueRequest) error {
+	f.editCalls++
+	f.editIssueID, f.editInput = issueID, input
+	return nil
+}
+
+func (f *fakeJira) TransitionIssue(_ context.Context, issueID, transitionID string) error {
+	f.transitionCalls++
+	f.transitionIssueID, f.transitionID = issueID, transitionID
+	return nil
+}
+
+func (f *fakeJira) AddComment(_ context.Context, issueID, body string) (jira.Comment, error) {
+	f.commentCalls++
+	f.commentIssueID, f.commentBody = issueID, body
+	return f.comment, nil
 }

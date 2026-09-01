@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -98,6 +99,96 @@ func TestLookupErrorsCarryRecoveryData(t *testing.T) {
 	ambiguous := Ambiguous("project", "W", candidates)
 	if len(ambiguous.Candidates) != 1 || !contains(ambiguous.Hint, "--project-id") {
 		t.Errorf("ambiguous recovery = %+v", ambiguous)
+	}
+}
+
+func TestCreateFieldsUnsupportedIsDeterministicBoundedAndActionable(t *testing.T) {
+	const (
+		genericHint     = "choose or configure a standard issue type so unsupported fields are optional or have Jira defaults"
+		descriptionHint = "re-run with --description to supply the required description field"
+		labelsHint      = "re-run with at least one --label to supply the required labels field"
+		bothHint        = "re-run with --description and at least one --label to supply the required description and labels fields"
+	)
+	maxLengthID := strings.Repeat("a", 255)
+	tests := []struct {
+		name               string
+		fieldIDs           []string
+		provideDescription bool
+		provideLabels      bool
+		wantMessage        string
+		wantHint           string
+		absent             []string
+	}{
+		{
+			name:     "description alone offers the bounded flag",
+			fieldIDs: []string{"description"}, provideDescription: true,
+			wantMessage: "Jira create metadata contains unsupported fields: description",
+			wantHint:    descriptionHint,
+		},
+		{
+			name:     "labels alone offers the repeated bounded flag",
+			fieldIDs: []string{"labels"}, provideLabels: true,
+			wantMessage: "Jira create metadata contains unsupported fields: labels",
+			wantHint:    labelsHint,
+		},
+		{
+			name:     "description and labels offer both bounded flags",
+			fieldIDs: []string{"labels", "description"}, provideDescription: true, provideLabels: true,
+			wantMessage: "Jira create metadata contains unsupported fields: description, labels",
+			wantHint:    bothHint,
+		},
+		{
+			name:     "field IDs are sorted and deduplicated",
+			fieldIDs: []string{"zeta", "alpha", "zeta"}, provideDescription: false,
+			wantMessage: "Jira create metadata contains unsupported fields: alpha, zeta",
+			wantHint:    genericHint,
+		},
+		{
+			name: "only eight safe field IDs are reported",
+			fieldIDs: []string{
+				"field_09", "field_08", "field_07", "field_06", "field_05", "field_04", "field_03", "field_02", "field_01", "field_00",
+				"BAD\nRAW_METADATA_SENTINEL", strings.Repeat("x", 256), "",
+			},
+			wantMessage: "Jira create metadata contains unsupported fields: field_00, field_01, field_02, field_03, field_04, field_05, field_06, field_07 (4 field IDs omitted)",
+			wantHint:    genericHint,
+			absent:      []string{"field_08", "field_09", "RAW_METADATA_SENTINEL", strings.Repeat("x", 32)},
+		},
+		{
+			name:        "255 byte ID is accepted and 256 byte ID is omitted",
+			fieldIDs:    []string{maxLengthID, strings.Repeat("b", 256)},
+			wantMessage: "Jira create metadata contains unsupported fields: " + maxLengthID + " (1 field IDs omitted)",
+			wantHint:    genericHint,
+			absent:      []string{strings.Repeat("b", 32)},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := CreateFieldsUnsupported(test.fieldIDs, test.provideDescription, test.provideLabels)
+			if err.Code != CodeUsage || ExitCode(err) != CodeUsage || err.Reason != "CREATE_FIELDS_UNSUPPORTED" {
+				t.Fatalf("contract = code:%d exit:%d reason:%q", err.Code, ExitCode(err), err.Reason)
+			}
+			if err.Message != test.wantMessage {
+				t.Fatalf("message = %q, want %q", err.Message, test.wantMessage)
+			}
+			if err.Hint != test.wantHint {
+				t.Fatalf("hint = %q, want %q", err.Hint, test.wantHint)
+			}
+			for _, value := range test.absent {
+				if strings.Contains(err.Message+err.Hint, value) {
+					t.Fatalf("bounded error leaked %q: %#v", value, err)
+				}
+			}
+		})
+	}
+}
+
+func TestLocalLockBusyHasStableRetryContract(t *testing.T) {
+	err := LocalLockBusy()
+	if err.Code != CodeRetryable || ExitCode(err) != CodeRetryable || err.Reason != "LOCAL_LOCK_BUSY" {
+		t.Fatalf("contract = code:%d exit:%d reason:%q", err.Code, ExitCode(err), err.Reason)
+	}
+	if err.RetryAfter != 0 || !strings.Contains(err.Hint, "retry") {
+		t.Fatalf("retry guidance = %#v", err)
 	}
 }
 

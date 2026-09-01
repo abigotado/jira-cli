@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -151,12 +152,74 @@ func Inexact(kind, query string, candidates []Candidate) *Error {
 	}
 }
 
+// CreateFieldsUnsupported reports create metadata that cannot accept the
+// bounded jira-cli payload. Only canonical field IDs are exposed, with a
+// strict count and length bound; Jira field names and raw metadata never
+// become part of the public error.
+func CreateFieldsUnsupported(fieldIDs []string, provideDescription bool, labelHint ...bool) *Error {
+	const (
+		maxReportedIDs  = 8
+		maxFieldIDBytes = 255
+	)
+	unique := make(map[string]struct{}, len(fieldIDs))
+	for _, fieldID := range fieldIDs {
+		if fieldID != "" {
+			unique[fieldID] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(unique))
+	for fieldID := range unique {
+		ordered = append(ordered, fieldID)
+	}
+	sort.Strings(ordered)
+
+	reported := make([]string, 0, min(len(ordered), maxReportedIDs))
+	omitted := 0
+	for _, fieldID := range ordered {
+		if len(reported) == maxReportedIDs || len(fieldID) > maxFieldIDBytes || !safeFieldID(fieldID) {
+			omitted++
+			continue
+		}
+		reported = append(reported, fieldID)
+	}
+	message := "Jira create metadata contains unsupported fields"
+	if len(reported) > 0 {
+		message += ": " + strings.Join(reported, ", ")
+	}
+	if omitted > 0 {
+		message += fmt.Sprintf(" (%d field IDs omitted)", omitted)
+	}
+	provideLabels := len(labelHint) > 0 && labelHint[0]
+	hint := "choose or configure a standard issue type so unsupported fields are optional or have Jira defaults"
+	switch {
+	case provideDescription && provideLabels && len(ordered) == 2 && ordered[0] == "description" && ordered[1] == "labels":
+		hint = "re-run with --description and at least one --label to supply the required description and labels fields"
+	case provideDescription && len(ordered) == 1 && ordered[0] == "description":
+		hint = "re-run with --description to supply the required description field"
+	case provideLabels && len(ordered) == 1 && ordered[0] == "labels":
+		hint = "re-run with at least one --label to supply the required labels field"
+	}
+	return &Error{
+		Code:    CodeUsage,
+		Reason:  "CREATE_FIELDS_UNSUPPORTED",
+		Message: message,
+		Hint:    hint,
+	}
+}
+
+// LocalLockBusy reports bounded contention on local profile or policy state.
+// The contended operation did not run when this error is returned.
+func LocalLockBusy() *Error {
+	return Retryable("LOCAL_LOCK_BUSY", 0, "another jira-cli process is using the selected local profile state").
+		WithHint("wait for the other jira-cli process to finish, then retry")
+}
+
 // Auth reports missing, rejected, or expired Jira credentials.
 func Auth(reason, format string, args ...any) *Error {
 	return &Error{Code: CodeAuth, Reason: reason, Message: fmt.Sprintf(format, args...), Hint: "run 'jira-cli auth login --profile NAME' or rotate the API token"}
 }
 
-// Retryable reports a rate limit or transient transport failure.
+// Retryable reports a transient failure known to be safe to retry.
 func Retryable(reason string, retryAfter time.Duration, format string, args ...any) *Error {
 	hint := "back off and retry if the operation is safe to repeat"
 	if retryAfter > 0 {
@@ -186,6 +249,36 @@ func Conflict(reason, format string, args ...any) *Error {
 	return &Error{Code: CodeConflict, Reason: reason, Message: fmt.Sprintf(format, args...), Hint: "re-read the issue and available transitions before deciding whether to retry"}
 }
 
+// WriteOutcomeUnknown reports that a write was dispatched but its result
+// could not be established safely. The caller must reconcile instead of
+// automatically repeating the request.
+func WriteOutcomeUnknown(operation string) *Error {
+	action := strings.TrimSpace(operation)
+	if action == "" {
+		action = "write"
+	}
+	return &Error{
+		Code:    CodeConflict,
+		Reason:  "WRITE_OUTCOME_UNKNOWN",
+		Message: fmt.Sprintf("the outcome of %s could not be established", action),
+		Hint:    fmt.Sprintf("re-read Jira to reconcile %s before deciding whether to retry", action),
+	}
+}
+
+// PayloadTooLarge reports a Jira endpoint's bounded payload rejection.
+func PayloadTooLarge(operation string) *Error {
+	action := strings.TrimSpace(operation)
+	if action == "" {
+		action = "request"
+	}
+	return &Error{
+		Code:    CodeUsage,
+		Reason:  "PAYLOAD_TOO_LARGE",
+		Message: fmt.Sprintf("Jira rejected the %s payload as too large", action),
+		Hint:    "shorten the plain-text fields and retry",
+	}
+}
+
 func upper(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -205,4 +298,18 @@ func upper(s string) string {
 
 func flagKind(kind string) string {
 	return strings.ReplaceAll(strings.ToLower(kind), "_", "-")
+}
+
+func safeFieldID(value string) bool {
+	for _, character := range value {
+		switch {
+		case character >= 'a' && character <= 'z':
+		case character >= 'A' && character <= 'Z':
+		case character >= '0' && character <= '9':
+		case character == '_', character == '-', character == '.', character == ':':
+		default:
+			return false
+		}
+	}
+	return value != ""
 }

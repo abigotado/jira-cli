@@ -60,7 +60,7 @@ new one is justified; if the caller's next move is the same, it is a new
 | 3 | not found | check the name; `did_you_mean` is in the envelope |
 | 4 | ambiguous | pick from `candidates` |
 | 5 | auth | re-authenticate |
-| 6 | retryable (rate limit, network) | back off, retry |
+| 6 | retryable (rate limit, read network, timeout, or local lock) | follow the hint, then retry safely |
 | 7 | confirmation required | add `--yes` |
 | 8 | permission / scope denied | stop and request permission or scope |
 | 9 | conflict / stale state | re-read the Jira object before retrying |

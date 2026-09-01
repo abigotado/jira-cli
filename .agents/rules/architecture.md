@@ -13,6 +13,7 @@ from that.
 | `internal/output` | envelope, `--fields` projection, text renderer | make network calls |
 | `internal/auth` | `CredentialStore`, native macOS Keychain, login transactions | be imported by `internal/jira` |
 | `internal/profile` | non-secret named profiles and validated Jira sites | read credentials |
+| `internal/writepolicy` | identity-bound non-secret project write allowlists | read credentials or call Jira |
 | `internal/skills` | safe installation for Codex and Claude Code | import auth or Jira clients |
 | `internal/jira` | hardened REST v3 client, retry, pagination, models | import `internal/auth` or `internal/profile` |
 | `internal/errx` | typed errors, exit codes, hints | import anything else in this module |
@@ -20,10 +21,12 @@ from that.
 ## Dependency direction
 
 ```
-cli → {output, auth, profile, skills, jira} → errx
+cli → {output, auth, profile, writepolicy, skills, jira} → errx
+writepolicy → {profile, lockfile}
 ```
 
-Three invariants, verified with `go list -deps` rather than by eye:
+Four dependency invariants are verified with `go list -deps` rather than by
+eye:
 
 - **`internal/jira` must not import `internal/auth`.** Credentials arrive as
   a value in the client constructor. Importing `auth` inverts the arrow and
@@ -33,6 +36,14 @@ Three invariants, verified with `go list -deps` rather than by eye:
   import here is what turns the bottom of the stack into a cycle.
 - **`internal/cli` never calls `net/http`.** If a command needs a request that
   the client does not expose, add the method to `internal/jira`.
+- **`internal/writepolicy` must not import `internal/auth` or `internal/jira`.**
+  Policy storage is local, identity-bound state; it neither reads credentials
+  nor contacts Jira.
+
+Lock ordering is a reviewed convention rather than an import-graph invariant:
+a flow that needs both the profile and write-policy locks acquires the profile
+lock first. Reversing that order can deadlock concurrent login, policy, and
+mutation commands.
 
 ## Context
 
@@ -51,6 +62,6 @@ are caller-selected exceptions; agents should use the non-TTY JSON default.
 ## Adding a command
 
 Every network command requires an explicit `--profile`; there is no active or
-stored default profile. Future mutations must use one shared construction
-helper so read-only, dry-run, confirmation, and project-allowlist rails cannot
-be skipped by a hand-built command.
+stored default profile. Mutations use the shared construction helper so input
+validation, dry-run, confirmation, identity binding, and project-allowlist
+rails cannot be skipped by a hand-built command.

@@ -1,6 +1,13 @@
 package jira
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/abigotado/jira-cli/internal/errx"
+)
 
 // User is the stable subset returned by /myself.
 type User struct {
@@ -98,4 +105,181 @@ type SearchRequest struct {
 type CommentPageOptions struct {
 	StartAt    int
 	MaxResults int
+}
+
+// IssueType is the stable subset of a Jira issue type used for safe create
+// discovery.
+type IssueType struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Subtask     bool   `json:"subtask"`
+}
+
+// IssueTypePage is an offset-based create-metadata issue type page.
+type IssueTypePage struct {
+	StartAt    int         `json:"startAt"`
+	MaxResults int         `json:"maxResults"`
+	Total      int         `json:"total"`
+	Values     []IssueType `json:"issueTypes"`
+}
+
+// issueTypeWire keeps presence information from Jira separate from the stable
+// public IssueType output model. Missing booleans must never silently become a
+// standard issue type.
+type issueTypeWire struct {
+	ID          *string `json:"id"`
+	Name        string  `json:"name"`
+	Description string  `json:"description,omitempty"`
+	Subtask     *bool   `json:"subtask"`
+}
+
+// issueTypePageWire distinguishes omitted pagination fields and issueTypes
+// from their legitimate zero and empty values.
+type issueTypePageWire struct {
+	StartAt    *int            `json:"startAt"`
+	MaxResults *int            `json:"maxResults"`
+	Total      *int            `json:"total"`
+	Values     []issueTypeWire `json:"issueTypes"`
+}
+
+// IssueTypePageOptions controls issue type pagination.
+type IssueTypePageOptions struct {
+	StartAt    int
+	MaxResults int
+}
+
+// IssueCreateField is the canonical subset of Jira create-field metadata
+// needed to decide whether jira-cli's bounded payload is supported.
+type IssueCreateField struct {
+	FieldID         string   `json:"fieldId"`
+	Operations      []string `json:"operations"`
+	HasDefaultValue *bool    `json:"hasDefaultValue"`
+	Required        *bool    `json:"required"`
+}
+
+// IssueCreateFieldPage is an offset-based create-field metadata page. Pointer
+// pagination fields distinguish a legitimate zero from an omitted field.
+type IssueCreateFieldPage struct {
+	StartAt    *int               `json:"startAt"`
+	MaxResults *int               `json:"maxResults"`
+	Total      *int               `json:"total"`
+	Fields     []IssueCreateField `json:"fields"`
+}
+
+// ADFDocument is the deliberately narrow Atlassian Document Format accepted
+// by jira-cli: one deterministic paragraph containing plain text only.
+type ADFDocument struct {
+	Version int       `json:"version"`
+	Type    string    `json:"type"`
+	Content []ADFNode `json:"content"`
+}
+
+// ADFNode is a paragraph in the narrow plain-text document model.
+type ADFNode struct {
+	Type    string      `json:"type"`
+	Content []ADFInline `json:"content,omitempty"`
+}
+
+// ADFInline is either an unformatted text leaf or a hard line break.
+type ADFInline struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+const (
+	maxSummaryRunes = 255
+	maxBodyRunes    = 32767
+	maxLabels       = 100
+	maxLabelRunes   = 255
+)
+
+// NewPlainTextDocument validates and converts bounded plain text to ADF.
+func NewPlainTextDocument(value, field string) (ADFDocument, error) {
+	if !utf8.ValidString(value) || strings.ContainsRune(value, '\x00') {
+		return ADFDocument{}, errx.Usage("--%s must be valid text without NUL bytes", field)
+	}
+	if utf8.RuneCountInString(value) > maxBodyRunes {
+		return ADFDocument{}, errx.Usage("--%s cannot exceed %d characters", field, maxBodyRunes)
+	}
+	normalized := strings.ReplaceAll(value, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	paragraph := ADFNode{Type: "paragraph"}
+	if normalized != "" {
+		lines := strings.Split(normalized, "\n")
+		paragraph.Content = make([]ADFInline, 0, len(lines)*2-1)
+		for index, line := range lines {
+			if line != "" {
+				paragraph.Content = append(paragraph.Content, ADFInline{Type: "text", Text: line})
+			}
+			if index < len(lines)-1 {
+				paragraph.Content = append(paragraph.Content, ADFInline{Type: "hardBreak"})
+			}
+		}
+	}
+	return ADFDocument{Version: 1, Type: "doc", Content: []ADFNode{paragraph}}, nil
+}
+
+// CreateIssueRequest contains the bounded fields jira-cli supports creating.
+type CreateIssueRequest struct {
+	ProjectID   string
+	IssueTypeID string
+	Summary     string
+	Description *string
+	Labels      []string
+}
+
+// EditIssueRequest contains the bounded fields jira-cli supports editing.
+type EditIssueRequest struct {
+	Summary          *string
+	Description      *string
+	ClearDescription bool
+}
+
+// ValidateSummary validates Jira's bounded one-line summary field.
+func ValidateSummary(summary string) error {
+	if strings.TrimSpace(summary) == "" || summary != strings.TrimSpace(summary) || !utf8.ValidString(summary) || containsLineOrControl(summary) {
+		return errx.Usage("--summary must be non-empty single-line text without surrounding whitespace")
+	}
+	if utf8.RuneCountInString(summary) > maxSummaryRunes {
+		return errx.Usage("--summary cannot exceed %d characters", maxSummaryRunes)
+	}
+	return nil
+}
+
+// ValidateLabels validates a bounded list of exact Jira label values without
+// normalizing their order or case.
+func ValidateLabels(labels []string) error {
+	if len(labels) > maxLabels {
+		return errx.Usage("--label cannot be repeated more than %d times", maxLabels)
+	}
+	seen := make(map[string]struct{}, len(labels))
+	for index, label := range labels {
+		if !utf8.ValidString(label) {
+			return errx.Usage("--label at position %d must be valid UTF-8", index+1)
+		}
+		count := utf8.RuneCountInString(label)
+		if count == 0 || count > maxLabelRunes {
+			return errx.Usage("--label at position %d must contain 1-%d characters", index+1, maxLabelRunes)
+		}
+		for _, character := range label {
+			if unicode.IsSpace(character) || unicode.IsControl(character) || unicode.Is(unicode.Zl, character) || unicode.Is(unicode.Zp, character) {
+				return errx.Usage("--label at position %d must not contain whitespace or control characters", index+1)
+			}
+		}
+		if _, exists := seen[label]; exists {
+			return errx.Usage("--label values must be unique")
+		}
+		seen[label] = struct{}{}
+	}
+	return nil
+}
+
+func containsLineOrControl(value string) bool {
+	for _, character := range value {
+		if unicode.IsControl(character) || unicode.Is(unicode.Zl, character) || unicode.Is(unicode.Zp, character) {
+			return true
+		}
+	}
+	return false
 }
