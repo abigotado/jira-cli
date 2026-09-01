@@ -29,7 +29,10 @@ const (
 	maxDrainBody    = 64 << 10
 )
 
-var classicHostPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.atlassian\.net$`)
+var (
+	classicHostPattern    = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.atlassian\.net$`)
+	errTransitionRejected = errors.New("Jira rejected the transition")
+)
 
 // TokenKind selects the Atlassian endpoint required by an API token.
 type TokenKind string
@@ -350,7 +353,7 @@ func (client *Client) translateStatus(response *http.Response, request request, 
 
 	case http.StatusBadRequest, http.StatusUnprocessableEntity:
 		if request.operation == "issues.transition" {
-			return 0, false, writeConflict(request.operation)
+			return 0, false, errTransitionRejected
 		}
 		return 0, false, errx.Usage("Jira rejected the request parameters")
 
@@ -369,7 +372,7 @@ func (client *Client) translateStatus(response *http.Response, request request, 
 	}
 }
 
-func writeConflict(operation string) error {
+func writeConflict(operation string) *errx.Error {
 	switch operation {
 	case "issues.create":
 		return errx.Conflict("ISSUE_CREATE_CONFLICT", "Jira rejected issue creation because related state changed")

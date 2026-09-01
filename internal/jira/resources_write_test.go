@@ -1013,22 +1013,166 @@ func TestCreateMetadataNotFoundNamesExactResourceAndNeverWrites(t *testing.T) {
 	}
 }
 
-func TestTransitionStaleStatusesAreConflictsAndNeverRetried(t *testing.T) {
-	for _, status := range []int{http.StatusBadRequest, http.StatusNotFound} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
-			calls := 0
-			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-				calls++
-				writer.WriteHeader(status)
+func TestTransitionRejectedStatusesAreReconciledBeforeClassifying(t *testing.T) {
+	const (
+		upstreamBodySentinel = "TRANSITION_UPSTREAM_BODY_SENTINEL"
+		transitionPath       = "/rest/api/3/issue/10001/transitions"
+		usageHint            = "check the transition requirements in Jira; do not retry unchanged"
+		conflictHint         = "re-read the issue and available transitions before deciding whether to retry"
+		separateReadHint     = "separately re-read the issue and available transitions before deciding whether to retry"
+	)
+	tests := []struct {
+		name              string
+		postStatus        int
+		getStatus         int
+		getBody           string
+		wantCode          errx.Code
+		wantReason        string
+		wantHint          string
+		wantGetCalls      int
+		wantWrappedCode   errx.Code
+		wantWrappedReason string
+	}{
+		{
+			name:         "bad request with available transition returns usage",
+			postStatus:   http.StatusBadRequest,
+			getStatus:    http.StatusOK,
+			getBody:      `{"transitions":[{"id":"31"}]}`,
+			wantCode:     errx.CodeUsage,
+			wantReason:   "USAGE",
+			wantHint:     usageHint,
+			wantGetCalls: 1,
+		},
+		{
+			name:         "unprocessable entity with available transition returns usage",
+			postStatus:   http.StatusUnprocessableEntity,
+			getStatus:    http.StatusOK,
+			getBody:      `{"transitions":[{"id":"31"}]}`,
+			wantCode:     errx.CodeUsage,
+			wantReason:   "USAGE",
+			wantHint:     usageHint,
+			wantGetCalls: 1,
+		},
+		{
+			name:         "bad request without available transition returns conflict",
+			postStatus:   http.StatusBadRequest,
+			getStatus:    http.StatusOK,
+			getBody:      `{"transitions":[{"id":"32"}]}`,
+			wantCode:     errx.CodeConflict,
+			wantReason:   "TRANSITION_CONFLICT",
+			wantHint:     conflictHint,
+			wantGetCalls: 1,
+		},
+		{
+			name:         "unprocessable entity without available transition returns conflict",
+			postStatus:   http.StatusUnprocessableEntity,
+			getStatus:    http.StatusOK,
+			getBody:      `{"transitions":[{"id":"32"}]}`,
+			wantCode:     errx.CodeConflict,
+			wantReason:   "TRANSITION_CONFLICT",
+			wantHint:     conflictHint,
+			wantGetCalls: 1,
+		},
+		{
+			name:              "unauthorized reconciliation returns conflict wrapping auth",
+			postStatus:        http.StatusBadRequest,
+			getStatus:         http.StatusUnauthorized,
+			wantCode:          errx.CodeConflict,
+			wantReason:        "TRANSITION_CONFLICT",
+			wantHint:          separateReadHint,
+			wantGetCalls:      1,
+			wantWrappedCode:   errx.CodeAuth,
+			wantWrappedReason: "AUTHENTICATION_FAILED",
+		},
+		{
+			name:              "server failure reconciliation returns conflict wrapping retryable",
+			postStatus:        http.StatusUnprocessableEntity,
+			getStatus:         http.StatusInternalServerError,
+			wantCode:          errx.CodeConflict,
+			wantReason:        "TRANSITION_CONFLICT",
+			wantHint:          separateReadHint,
+			wantGetCalls:      maxAttempts,
+			wantWrappedCode:   errx.CodeRetryable,
+			wantWrappedReason: "SERVER_ERROR",
+		},
+		{
+			name:         "not found returns direct conflict without reconciliation",
+			postStatus:   http.StatusNotFound,
+			wantCode:     errx.CodeConflict,
+			wantReason:   "TRANSITION_CONFLICT",
+			wantHint:     conflictHint,
+			wantGetCalls: 0,
+		},
+		{
+			name:         "conflict returns direct conflict without reconciliation",
+			postStatus:   http.StatusConflict,
+			wantCode:     errx.CodeConflict,
+			wantReason:   "TRANSITION_CONFLICT",
+			wantHint:     conflictHint,
+			wantGetCalls: 0,
+		},
+		{
+			name:         "precondition failed returns direct conflict without reconciliation",
+			postStatus:   http.StatusPreconditionFailed,
+			wantCode:     errx.CodeConflict,
+			wantReason:   "TRANSITION_CONFLICT",
+			wantHint:     conflictHint,
+			wantGetCalls: 0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			postCalls := 0
+			getCalls := 0
+			var logs bytes.Buffer
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.URL.Path != transitionPath {
+					t.Errorf("path = %q, want %q", request.URL.Path, transitionPath)
+					writer.WriteHeader(http.StatusNotFound)
+					return
+				}
+				switch request.Method {
+				case http.MethodPost:
+					postCalls++
+					writer.WriteHeader(test.postStatus)
+				case http.MethodGet:
+					getCalls++
+					writer.WriteHeader(test.getStatus)
+					if test.getStatus == http.StatusOK {
+						_, _ = io.WriteString(writer, test.getBody)
+						return
+					}
+				default:
+					t.Errorf("method = %q, want POST or GET", request.Method)
+					writer.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				_, _ = io.WriteString(writer, upstreamBodySentinel)
 			}))
 			defer server.Close()
-			err := newTestClient(t, server).TransitionIssue(context.Background(), "10001", "31")
-			var typed *errx.Error
-			if !errors.As(err, &typed) || typed.Code != errx.CodeConflict || typed.Reason != "TRANSITION_CONFLICT" {
-				t.Fatalf("error = %#v, want TRANSITION_CONFLICT", typed)
+
+			err := newTestClient(t, server, WithLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))).TransitionIssue(context.Background(), "10001", "31")
+			if got := errx.ExitCode(err); got != test.wantCode {
+				t.Fatalf("exit code = %d, want %d (err=%v)", got, test.wantCode, err)
 			}
-			if calls != 1 {
-				t.Fatalf("calls = %d, want 1", calls)
+			var typed *errx.Error
+			if !errors.As(err, &typed) || typed.Code != test.wantCode || typed.Reason != test.wantReason || typed.Hint != test.wantHint {
+				t.Fatalf("error = %#v, want code=%d reason=%q hint=%q", typed, test.wantCode, test.wantReason, test.wantHint)
+			}
+			if postCalls != 1 || getCalls != test.wantGetCalls {
+				t.Fatalf("calls = POST:%d GET:%d, want POST:1 GET:%d", postCalls, getCalls, test.wantGetCalls)
+			}
+			if test.wantWrappedCode != 0 {
+				var wrapped *errx.Error
+				if !errors.As(errors.Unwrap(typed), &wrapped) || wrapped.Code != test.wantWrappedCode || wrapped.Reason != test.wantWrappedReason {
+					t.Fatalf("wrapped error = %#v, want code=%d reason=%q", wrapped, test.wantWrappedCode, test.wantWrappedReason)
+				}
+			}
+			combined := err.Error() + logs.String()
+			for _, sentinel := range []string{upstreamBodySentinel, testToken, testEmail, "Authorization"} {
+				if strings.Contains(combined, sentinel) {
+					t.Fatalf("output leaked %q: %s", sentinel, combined)
+				}
 			}
 		})
 	}

@@ -2,6 +2,7 @@ package jira
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -404,13 +405,30 @@ func (client *Client) TransitionIssue(ctx context.Context, issueID, transitionID
 	type transition struct {
 		ID string `json:"id"`
 	}
-	return client.do(ctx, request{
+	err := client.do(ctx, request{
 		method: http.MethodPost, path: "/rest/api/3/issue/" + url.PathEscape(issueID) + "/transitions",
 		body: struct {
 			Transition transition `json:"transition"`
 		}{Transition: transition{ID: transitionID}},
 		policy: requestPolicyWrite, operation: "issues.transition", wantStatus: http.StatusNoContent,
 	}, nil)
+	if !errors.Is(err, errTransitionRejected) {
+		return err
+	}
+
+	transitions, err := client.Transitions(ctx, issueID)
+	if err != nil {
+		return writeConflict("issues.transition").
+			WithHint("separately re-read the issue and available transitions before deciding whether to retry").
+			Wrap(err)
+	}
+	for _, available := range transitions {
+		if available.ID == transitionID {
+			return errx.Usage("Jira rejected the transition parameters").
+				WithHint("check the transition requirements in Jira; do not retry unchanged")
+		}
+	}
+	return writeConflict("issues.transition")
 }
 
 // AddComment adds one bounded plain-text ADF comment to a numeric issue ID.
